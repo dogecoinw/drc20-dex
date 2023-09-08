@@ -1,5 +1,7 @@
+use base58::ToBase58;
 use bitcoin::hashes::hex::ToHex;
-
+use ripemd::{Digest, Ripemd160};
+use sha2::Sha256;
 use {
     super::*,
     bitcoin::{
@@ -9,6 +11,14 @@ use {
     },
     std::str,
 };
+
+pub fn checksum(data: &[u8]) -> Vec<u8> {
+    Sha256::digest(&Sha256::digest(&data)).to_vec()
+}
+
+pub fn hash160(bytes: &[u8]) -> Vec<u8> {
+    Ripemd160::digest(&Sha256::digest(&bytes)).to_vec()
+}
 
 const PROTOCOL_ID: &[u8] = b"ord";
 
@@ -30,17 +40,33 @@ impl Inscription {
         Self { content_type, body }
     }
 
-    pub(crate) fn from_transactions(txs: Vec<Transaction>) -> ParsedInscription {
-        let mut sig_scripts = Vec::with_capacity(txs.len());
-        for i in 0..txs.len() {
-            if txs[i].input.is_empty() {
-                return ParsedInscription::None;
-            }
-            sig_scripts.push(txs[i].input[0].script_sig.clone());
+    pub(crate) fn from_transactions(tx: &Transaction) -> ParsedInscription {
+        let mut sig_scripts = Vec::new();
+        if tx.input.is_empty() {
+            return ParsedInscription::None;
         }
-        InscriptionParser::parse(&sig_scripts)
+        for (index, tx_in) in tx.input.iter().enumerate() {
+            if index < 2 {
+                // parse input[0] or input[1]
+                sig_scripts.push(tx_in.script_sig.clone());
+            }
+        }
+
+        let res = InscriptionParser::parse(&sig_scripts[0]);
+        if res == ParsedInscription::None && sig_scripts.len() > 1 {
+            InscriptionParser::parse(&sig_scripts[1])
+        } else {
+            res
+        }
     }
 
+    pub fn addr_from_sigscript(sig_script: &Script) -> Result<Option<String>> {
+        InscriptionParser::recover_addr_from_sigscript(sig_script)
+    }
+
+    pub fn addr_from_pkscript(pk_script: &Script) -> Result<Option<String>> {
+        InscriptionParser::recover_addr_from_pubkeyscript(pk_script)
+    }
     fn append_reveal_script_to_builder(&self, mut builder: script::Builder) -> script::Builder {
         builder = builder
             .push_opcode(opcodes::OP_FALSE)
@@ -85,8 +111,7 @@ impl Inscription {
 struct InscriptionParser {}
 
 impl InscriptionParser {
-    fn parse(sig_scripts: &Vec<Script>) -> ParsedInscription {
-        let sig_script = &sig_scripts[0];
+    fn parse(sig_script: &Script) -> ParsedInscription {
         if sig_script.len() < 143 {
             return ParsedInscription::None;
         }
@@ -135,6 +160,58 @@ impl InscriptionParser {
         };
 
         return ParsedInscription::Complete(inscription);
+    }
+
+    fn recover_addr_from_sigscript(sig_script: &Script) -> Result<Option<String>> {
+        let push_datas_vec = match Self::decode_push_datas(&sig_script) {
+            Some(push_datas) => push_datas,
+            None => return Ok(None),
+        };
+        if push_datas_vec.len() != 2 {
+            return Ok(None);
+        }
+        if push_datas_vec[0].len() != 71 && push_datas_vec[0].len() != 72 {
+            // signature error
+            return Ok(None);
+        }
+        if push_datas_vec[1].len() != 33 {
+            return Ok(None);
+        }
+
+        let mut address = [0u8; 25];
+        address[0] = 0x1e;
+        address[1..21].copy_from_slice(&hash160(&push_datas_vec[1]));
+
+        let sum = &checksum(&address[0..21])[0..4];
+        address[21..25].copy_from_slice(sum);
+        let addr = address.to_base58();
+
+        Ok(Some(addr))
+    }
+
+    fn recover_addr_from_pubkeyscript(pk_script: &Script) -> Result<Option<String>> {
+        let bytes = pk_script.as_bytes();
+        println!("len is {}", bytes.len());
+        if bytes.len() >= 25 {
+            //OP_DUP
+            if bytes[0] == 0x76 {
+                // OP_HASH160
+                if bytes[1] == 0xa9 {
+                    // Length
+                    if bytes[2] == 0x14 {
+                        let mut address = [0u8; 25];
+                        address[0] = 0x1e;
+                        address[1..21].copy_from_slice(&bytes[3..23]);
+                        let sum = &checksum(&address[0..21])[0..4];
+                        address[21..25].copy_from_slice(sum);
+
+                        return Ok(Some(address.to_base58()));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     fn decode_push_datas(script: &Script) -> Option<Vec<Vec<u8>>> {
@@ -230,212 +307,36 @@ impl InscriptionParser {
     }
 }
 
-struct InscriptionParserDogi {}
+#[cfg(test)]
+mod tests {
+    use bitcoin::hashes::hex::FromHex;
 
-impl InscriptionParserDogi {
-    fn parse(sig_scripts: &Vec<Script>) -> ParsedInscription {
-        let sig_script = &sig_scripts[0];
+    use super::*;
 
-        let mut push_datas_vec = match Self::decode_push_datas(sig_script) {
-            Some(push_datas) => push_datas,
-            None => return ParsedInscription::None,
-        };
-
-        let mut push_datas = push_datas_vec.as_slice();
-
-        // read protocol
-
-        if push_datas.len() < 3 {
-            return ParsedInscription::None;
-        }
-
-        let protocol = &push_datas[0];
-
-        if protocol != PROTOCOL_ID {
-            return ParsedInscription::None;
-        }
-
-        // read npieces
-
-        let mut npieces = match Self::push_data_to_number(&push_datas[1]) {
-            Some(n) => n,
-            None => return ParsedInscription::None,
-        };
-
-        if npieces == 0 {
-            return ParsedInscription::None;
-        }
-
-        // read content type
-
-        let content_type = push_datas[2].clone();
-
-        push_datas = &push_datas[3..];
-
-        // read body
-
-        let mut body = vec![];
-
-        let mut sig_scripts = sig_scripts.as_slice();
-
-        // loop over transactions
-        loop {
-            // loop over chunks
-            loop {
-                if npieces == 0 {
-                    let inscription = Inscription {
-                        content_type: Some(content_type),
-                        body: Some(body),
-                    };
-
-                    return ParsedInscription::Complete(inscription);
-                }
-
-                if push_datas.len() < 2 {
-                    break;
-                }
-
-                let next = match Self::push_data_to_number(&push_datas[0]) {
-                    Some(n) => n,
-                    None => break,
-                };
-
-                if next != npieces - 1 {
-                    break;
-                }
-
-                body.append(&mut push_datas[1].clone());
-
-                push_datas = &push_datas[2..];
-                npieces -= 1;
-            }
-
-            if sig_scripts.len() <= 1 {
-                return ParsedInscription::None;
-            }
-
-            sig_scripts = &sig_scripts[1..];
-
-            push_datas_vec = match Self::decode_push_datas(&sig_scripts[0]) {
-                Some(push_datas) => push_datas,
-                None => return ParsedInscription::None,
-            };
-
-            if push_datas_vec.len() < 2 {
-                return ParsedInscription::None;
-            }
-
-            let next = match Self::push_data_to_number(&push_datas_vec[0]) {
-                Some(n) => n,
-                None => return ParsedInscription::None,
-            };
-
-            if next != npieces - 1 {
-                return ParsedInscription::None;
-            }
-
-            push_datas = push_datas_vec.as_slice();
-        }
+    #[test]
+    fn empty() {
+        assert_eq!(
+            InscriptionParser::parse(&Script::new()),
+            ParsedInscription::None
+        );
     }
 
-    fn decode_push_datas(script: &Script) -> Option<Vec<Vec<u8>>> {
-        let mut bytes = script.as_bytes();
-        let mut push_datas = vec![];
-
-        while !bytes.is_empty() {
-            // op_0
-            if bytes[0] == 0 {
-                push_datas.push(vec![]);
-                bytes = &bytes[1..];
-                continue;
-            }
-
-            // op_1 - op_16
-            if bytes[0] >= 81 && bytes[0] <= 96 {
-                push_datas.push(vec![bytes[0] - 80]);
-                bytes = &bytes[1..];
-                continue;
-            }
-
-            // op_push 1-75
-            if bytes[0] >= 1 && bytes[0] <= 75 {
-                let len = bytes[0] as usize;
-                if bytes.len() < 1 + len {
-                    return None;
-                }
-                push_datas.push(bytes[1..1 + len].to_vec());
-                bytes = &bytes[1 + len..];
-                continue;
-            }
-
-            // op_pushdata1
-            if bytes[0] == 76 {
-                if bytes.len() < 2 {
-                    return None;
-                }
-                let len = bytes[1] as usize;
-                if bytes.len() < 2 + len {
-                    return None;
-                }
-                push_datas.push(bytes[2..2 + len].to_vec());
-                bytes = &bytes[2 + len..];
-                continue;
-            }
-
-            // op_pushdata2
-            if bytes[0] == 77 {
-                if bytes.len() < 3 {
-                    return None;
-                }
-                let len = ((bytes[1] as usize) << 8) + ((bytes[0] as usize) << 0);
-                if bytes.len() < 3 + len {
-                    return None;
-                }
-                push_datas.push(bytes[3..3 + len].to_vec());
-                bytes = &bytes[3 + len..];
-                continue;
-            }
-
-            // op_pushdata4
-            if bytes[0] == 78 {
-                if bytes.len() < 5 {
-                    return None;
-                }
-                let len = ((bytes[3] as usize) << 24)
-                    + ((bytes[2] as usize) << 16)
-                    + ((bytes[1] as usize) << 8)
-                    + ((bytes[0] as usize) << 0);
-                if bytes.len() < 5 + len {
-                    return None;
-                }
-                push_datas.push(bytes[5..5 + len].to_vec());
-                bytes = &bytes[5 + len..];
-                continue;
-            }
-
-            return None;
-        }
-
-        Some(push_datas)
+    #[test]
+    fn test_sigscript() {
+        assert_eq!(
+        InscriptionParser::recover_addr_from_sigscript(
+            &Script::from_hex("47304402201e2cddd74480d7ede31688161374736edea8253749cd5254370d2ae8612edad802204132c16105f539352ff54eff68db179b1fa3fdc2840c9e6cff320843d7c6ea57012102ba104849d5fb6ca3541ac8f7bcfcea2aaa66d337ac24f1960bae02867c79a130").unwrap()
+        ).unwrap(),
+        Some("DQJYzXuMdK949fdu7Nvv9FzPqXhdaXdBFD".to_string()));
     }
-
-    fn push_data_to_number(data: &[u8]) -> Option<u64> {
-        if data.len() == 0 {
-            return Some(0);
-        }
-
-        if data.len() > 8 {
-            return None;
-        }
-
-        let mut n: u64 = 0;
-        let mut m: u64 = 0;
-
-        for i in 0..data.len() {
-            n += (data[i] as u64) << m;
-            m += 8;
-        }
-
-        return Some(n);
+    #[test]
+    fn test_pubkeyscript() {
+        assert_eq!(
+            InscriptionParser::recover_addr_from_pubkeyscript(
+                &Script::from_hex("76a9145473450c6472d8338e71fb2fc17b8f6440e1838d88ac").unwrap(),
+            )
+            .unwrap(),
+            Some("DCqdPTDP47dJeuJ4QybXFL7BP5V5H4c2nj".to_string())
+        );
     }
 }

@@ -1,7 +1,6 @@
 use {
     self::inscription_updater::InscriptionUpdater,
     super::{fetcher::Fetcher, *},
-    base58::ToBase58,
     bitcoin::hashes::hex::ToHex,
     bitcoin::{util::key::PublicKey, Script},
     core::str::FromStr,
@@ -357,7 +356,7 @@ impl Updater {
 
                         let Ok(_) = value_sender.send(tx_out.value).await else {
                             log::error!("Value channel closed unexpectedly");
-                             return;
+                            return;
                         };
                     }
                 }
@@ -380,7 +379,7 @@ impl Updater {
         // If value_receiver still has values something went wrong with the last block
         // Could be an assert, shouldn't recover from this and commit the last block
         let Err(TryRecvError::Empty) = value_receiver.try_recv() else {
-            return Err(anyhow!("Previous block did not consume all input values")); 
+            return Err(anyhow!("Previous block did not consume all input values"));
         };
 
         let mut outpoint_to_value = wtx.open_table(OUTPOINT_TO_VALUE)?;
@@ -463,7 +462,7 @@ impl Updater {
             .map(|lost_sats| lost_sats.value())
             .unwrap_or(0);
         let mut id_to_dex = wtx.open_table(ID_TO_DEX)?;
-        let mut dex_to_state = wtx.open_table(DEX_TO_STATE)?;
+        let mut drc_to_act = wtx.open_multimap_table(DRC_TO_ACCOUNT)?;
         let mut inscription_updater = InscriptionUpdater::new(
             self.height,
             &mut inscription_id_to_satpoint,
@@ -478,13 +477,14 @@ impl Updater {
             &mut sat_to_inscription_id,
             &mut satpoint_to_inscription_id,
             &mut id_to_dex,
-            &mut dex_to_state,
+            &mut drc_to_act,
             block.header.time,
             value_cache,
             addr_cache,
         )?;
         for (tx, txid) in block.txdata.iter().skip(1).chain(block.txdata.first()) {
-            lost_sats += inscription_updater.index_transaction_inscriptions(tx, *txid, None)?;
+            lost_sats +=
+                inscription_updater.index_transaction_inscriptions(index, tx, *txid, None)?;
         }
 
         statistic_to_count.insert(&Statistic::LostSats.key(), &lost_sats)?;

@@ -3,6 +3,7 @@ use std::io::Cursor;
 
 use self::entry::{DexEntryValue, DexInscriptionValue};
 
+use crate::index::entry::*;
 use {
     self::{
         entry::{
@@ -12,12 +13,17 @@ use {
         updater::Updater,
     },
     super::*,
+    base58::{FromBase58, ToBase58},
     bitcoin::BlockHeader,
     bitcoincore_rpc::{json::GetBlockHeaderResult, Auth, Client},
     chrono::SubsecRound,
     indicatif::{ProgressBar, ProgressStyle},
     log::log_enabled,
-    redb::{Database, ReadableTable, Table, TableDefinition, WriteStrategy, WriteTransaction},
+    redb::{
+        Database, MultimapTable, MultimapTableDefinition, ReadableMultimapTable, ReadableTable,
+        Table, TableDefinition, WriteStrategy, WriteTransaction,
+    },
+    sha2::{Digest, Sha256},
     std::collections::HashMap,
     std::sync::atomic::{self, AtomicBool},
 };
@@ -32,6 +38,13 @@ const SCHEMA_VERSION: u64 = 3;
 macro_rules! define_table {
     ($name:ident, $key:ty, $value:ty) => {
         const $name: TableDefinition<$key, $value> = TableDefinition::new(stringify!($name));
+    };
+}
+
+macro_rules! define_multimap_table {
+    ($name:ident, $key:ty, $value:ty) => {
+        const $name: MultimapTableDefinition<$key, $value> =
+            MultimapTableDefinition::new(stringify!($name));
     };
 }
 
@@ -51,7 +64,7 @@ define_table! { SAT_TO_SATPOINT, u128, &SatPointValue }
 define_table! { STATISTIC_TO_COUNT, u64, u64 }
 define_table! { WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP, u64, u128 }
 define_table! { ID_TO_DEX, u64, DexEntryValue}
-define_table! { DEX_TO_STATE, DexEntryValue, &DexInscriptionValue}
+define_multimap_table! { DRC_TO_ACCOUNT, &str, &DexInscriptionValue}
 
 pub(crate) struct Index {
     auth: Auth,
@@ -423,6 +436,16 @@ impl Index {
         }
     }
 
+    pub(crate) fn id_to_dex(&self, id: u64) -> Result<Option<DexEntryValue>> {
+        let rtx = self.database.begin_read()?;
+        let binding = rtx.open_table(ID_TO_DEX)?;
+        let res = binding.get(id)?;
+        match res {
+            None => Ok(None),
+            Some(state) => Ok(Some(state.value())),
+        }
+    }
+
     pub(crate) fn block_header(&self, hash: BlockHash) -> Result<Option<BlockHeader>> {
         self.client.get_block_header(&hash).into_option()
     }
@@ -522,11 +545,10 @@ impl Index {
 
         match txids_result {
             Some(txids) => {
-                let mut txs = vec![];
-
                 let txids = txids.value();
 
                 for i in 0..txids.len() / 32 {
+                    let tx: Transaction;
                     let txid_buf = &txids[i * 32..i * 32 + 32];
                     let table = reader.open_table(INSCRIPTION_TXID_TO_TX)?;
                     let tx_result = table.get(txid_buf)?;
@@ -535,19 +557,20 @@ impl Index {
                         Some(tx_result) => {
                             let tx_buf = tx_result.value().to_vec();
                             let mut cursor = Cursor::new(tx_buf);
-                            let tx = bitcoin::Transaction::consensus_decode(&mut cursor)?;
-                            txs.push(tx);
+                            tx = bitcoin::Transaction::consensus_decode(&mut cursor)?;
+                            let parsed_inscription = Inscription::from_transactions(&tx);
+
+                            match parsed_inscription {
+                                ParsedInscription::None => return Ok(None),
+                                ParsedInscription::Complete(inscription) => {
+                                    return Ok(Some(inscription))
+                                }
+                            }
                         }
                         None => return Ok(None),
                     }
                 }
-
-                let parsed_inscription = Inscription::from_transactions(txs);
-
-                match parsed_inscription {
-                    ParsedInscription::None => return Ok(None),
-                    ParsedInscription::Complete(inscription) => Ok(Some(inscription)),
-                }
+                Ok(None)
             }
 
             None => return Ok(None),
@@ -788,6 +811,219 @@ impl Index {
             .open_table(INSCRIPTION_ID_TO_INSCRIPTION_ENTRY)?
             .get(&inscription_id.store())?
             .map(|value| InscriptionEntry::load(value.value())))
+    }
+
+    pub(crate) fn get_drc_amt(&self, key: &str, addr: &str) -> Result<Option<u128>> {
+        let rtx = self.database.begin_read().unwrap();
+        let table = rtx.open_multimap_table(DRC_TO_ACCOUNT).unwrap();
+        let address: Result<[u8; 25], _> = String::from(addr).from_base58().unwrap().try_into();
+        match address {
+            Ok(addr) => {
+                let mut iter = table.get(key).unwrap();
+                loop {
+                    if let Some(item_value) = iter.next() {
+                        let mut data: [u8; 25] = [0; 25];
+                        data.copy_from_slice(&item_value.value()[16..41]);
+                        if addr == data {
+                            let mut buf: [u8; 16] = [0; 16];
+                            buf[..16].copy_from_slice(&item_value.value()[..16]);
+                            let amt = u128::from_le_bytes(buf);
+                            return Ok(Some(amt));
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+
+        Ok(None)
+    }
+
+    fn get_vec(
+        table: &impl ReadableMultimapTable<&'static str, &'static DexInscriptionValue>,
+        key: &str,
+    ) -> Vec<DexInscriptionValue> {
+        let mut result = vec![];
+        let mut iter = table.get(key).unwrap();
+        loop {
+            let item = iter.next();
+            if let Some(item_value) = item {
+                result.push(*item_value.value());
+            } else {
+                return result;
+            }
+        }
+    }
+    pub(crate) fn insert_drc_act(
+        &self,
+        key: &str,
+        entry: &DexInscription,
+    ) -> Result<(), &'static str> {
+        let wtx = self.database.begin_write().unwrap();
+        {
+            let mut wtbl = wtx.open_multimap_table(DRC_TO_ACCOUNT).unwrap();
+            wtbl.insert(
+                key,
+                &DexInscription::store(DexInscription {
+                    addr: (entry.addr.clone()),
+                    amt: (entry.amt),
+                }),
+            )
+            .unwrap();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn transfer_drc(
+        &self,
+        key: &str,
+        src_addr: &str,
+        dst_addr: &str,
+        amt: u128,
+    ) -> Result<(), &'static str> {
+        let src: Result<[u8; 25], _> = String::from(src_addr).from_base58().unwrap().try_into();
+        let dst: Result<[u8; 25], _> = String::from(dst_addr).from_base58().unwrap().try_into();
+        let src = match src {
+            Ok(addr) => addr,
+            Err(_) => return Err("invalid src addr format"),
+        };
+        let dst = match dst {
+            Ok(addr) => addr,
+            Err(_) => return Err("invalid dst addr format"),
+        };
+        let rtx = self.database.begin_read().unwrap();
+        let rtbl = rtx.open_multimap_table(DRC_TO_ACCOUNT).unwrap();
+        let res = Self::get_vec(&rtbl, key);
+        if !res.is_empty() {
+            let mut b_src = false;
+            let mut b_dst = false;
+            let mut src_act_pre = DexInscription {
+                addr: src_addr.to_string(),
+                amt: 0,
+            };
+            let mut dst_act_pre = DexInscription {
+                addr: dst_addr.to_string(),
+                amt: 0,
+            };
+            let mut src_act_cur = DexInscription {
+                addr: src_addr.to_string(),
+                amt: 0,
+            };
+            let mut dst_act_cur = DexInscription {
+                addr: dst_addr.to_string(),
+                amt: 0,
+            };
+
+            for item in res {
+                let mut data: [u8; 25] = [0; 25];
+                data.copy_from_slice(&item[16..41]);
+                if src == data && !b_src {
+                    // in table
+                    let mut buf: [u8; 16] = [0; 16];
+                    buf[..16].copy_from_slice(&item[..16]);
+                    let amt_src = u128::from_le_bytes(buf);
+                    src_act_pre.amt = amt_src;
+                    if amt_src >= amt {
+                        src_act_cur.amt = amt_src - amt;
+                        b_src = true;
+                    } else {
+                        return Err("source addr balance not enough");
+                    }
+                }
+                if dst == data && !b_dst {
+                    // in table
+                    let mut buf: [u8; 16] = [0; 16];
+                    buf[..16].copy_from_slice(&item[..16]);
+                    let amt_dst = u128::from_le_bytes(buf);
+                    dst_act_pre.amt = amt_dst;
+
+                    dst_act_cur.amt = amt_dst + amt;
+                    b_dst = true;
+                }
+                if b_dst && b_src {
+                    // get both address
+                    break;
+                }
+            }
+            if !b_dst {
+                // dst addr is new
+                dst_act_cur.amt = amt;
+            }
+            if !b_src {
+                return Err("src address not found");
+            }
+            let wtx = self.database.begin_write().unwrap();
+            {
+                let mut wtbl = wtx.open_multimap_table(DRC_TO_ACCOUNT).unwrap();
+                wtbl.remove(key, &DexInscription::store(src_act_pre))
+                    .unwrap();
+                wtbl.remove(key, &DexInscription::store(dst_act_pre))
+                    .unwrap();
+                wtbl.insert(key, &DexInscription::store(src_act_cur))
+                    .unwrap();
+                wtbl.insert(key, &DexInscription::store(dst_act_cur))
+                    .unwrap();
+            }
+            wtx.commit().unwrap();
+            return Ok(());
+        } else {
+            return Err("drc doesn't support");
+        }
+    }
+
+    pub(crate) fn get_dex_id(&self, tick0: &String, tick1: &String) -> Option<u64> {
+        if tick0.is_empty() || tick1.is_empty() {
+            return None;
+        }
+        let h0;
+        let h1: u64;
+        let mut hasher = Sha256::new();
+        hasher.update(tick0);
+
+        if let Ok(data) = hasher.finalize()[0..8].try_into() {
+            h0 = u64::from_ne_bytes(data);
+        } else {
+            return None;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(tick1);
+        if let Ok(data) = hasher.finalize()[0..8].try_into() {
+            h1 = u64::from_ne_bytes(data);
+        } else {
+            return None;
+        }
+
+        Some(h0 ^ h1)
+    }
+
+    pub(crate) fn get_dex_name(&self, tick0: &String, tick1: &String) -> Option<(String, bool)> {
+        if tick0.is_empty() || tick1.is_empty() {
+            return None;
+        }
+        let h0;
+        let h1: u64;
+        let mut hasher = Sha256::new();
+        hasher.update(tick0);
+
+        if let Ok(data) = hasher.finalize()[0..8].try_into() {
+            h0 = u64::from_ne_bytes(data);
+        } else {
+            return None;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(tick1);
+        if let Ok(data) = hasher.finalize()[0..8].try_into() {
+            h1 = u64::from_ne_bytes(data);
+        } else {
+            return None;
+        }
+        if h0 <= h1 {
+            let tick = tick0.clone() + tick1;
+            Some((tick, true))
+        } else {
+            let tick = tick1.clone() + tick0;
+            Some((tick, false))
+        }
     }
 
     #[cfg(test)]

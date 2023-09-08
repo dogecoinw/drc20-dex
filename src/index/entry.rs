@@ -172,7 +172,7 @@ impl Entry for DexEntry {
 }
 
 pub(crate) struct DexInscription {
-    pub(crate) addr: [u8; 25],
+    pub(crate) addr: String,
     pub(crate) amt: u128,
 }
 
@@ -181,18 +181,30 @@ pub(crate) type DexInscriptionValue = [u8; 41];
 impl Entry for DexInscription {
     type Value = DexInscriptionValue;
     fn load(value: Self::Value) -> Self {
-        let (addr, amt) = value.split_at(25);
+        let mut buf: [u8; 16] = [0; 16];
+        buf[..16].copy_from_slice(&value[..16]);
+        let amt = u128::from_le_bytes(buf);
+
+        let mut buf: [u8; 25] = [0; 25];
+        buf[..25].copy_from_slice(&value[32..]);
+        let addr = buf.to_base58();
+
         Self {
-            addr: (addr.try_into().expect("length incorrect")),
-            amt: u128::from_be_bytes(amt.try_into().unwrap()),
+            addr: addr,
+            amt: amt,
         }
     }
 
     fn store(self) -> Self::Value {
-        let mut value = [0; 41];
-        let (addr, amt) = value.split_at_mut(25);
-        addr.copy_from_slice(&self.addr);
-        amt.copy_from_slice(&self.amt.to_be_bytes());
+        let mut value: [u8; 41] = [0; 41];
+        value[..16].copy_from_slice(&self.amt.to_le_bytes());
+        let address: Result<[u8; 25], _> = self.addr.from_base58().unwrap().try_into();
+        match address {
+            Ok(addr) => {
+                value[16..41].copy_from_slice(&addr);
+            }
+            Err(_) => {}
+        }
         value
     }
 }

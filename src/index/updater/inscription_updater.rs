@@ -60,7 +60,7 @@ pub(super) struct InscriptionUpdater<'a, 'db, 'tx> {
     sat_to_inscription_id: &'a mut Table<'db, 'tx, u128, &'static InscriptionIdValue>,
     satpoint_to_id: &'a mut Table<'db, 'tx, &'static SatPointValue, &'static InscriptionIdValue>,
     id_to_dex: &'a mut Table<'db, 'tx, u64, DexEntryValue>,
-    dex_to_state: &'a mut Table<'db, 'tx, DexEntryValue, &'static DexInscriptionValue>,
+    drc_to_act: &'a mut MultimapTable<'db, 'tx, &'static str, &'static DexInscriptionValue>,
     timestamp: u32,
     value_cache: &'a mut HashMap<OutPoint, u64>,
     addr_cache: &'a mut HashMap<OutPoint, UTXO>,
@@ -91,7 +91,7 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
             &'static InscriptionIdValue,
         >,
         id_to_dex: &'a mut Table<'db, 'tx, u64, DexEntryValue>,
-        dex_to_state: &'a mut Table<'db, 'tx, DexEntryValue, &'static DexInscriptionValue>,
+        drc_to_act: &'a mut MultimapTable<'db, 'tx, &str, &'static DexInscriptionValue>,
         timestamp: u32,
         value_cache: &'a mut HashMap<OutPoint, u64>,
         addr_cache: &'a mut HashMap<OutPoint, UTXO>,
@@ -120,7 +120,7 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
             sat_to_inscription_id,
             satpoint_to_id,
             id_to_dex,
-            dex_to_state,
+            drc_to_act,
             timestamp,
             value_cache,
             addr_cache,
@@ -129,6 +129,7 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
 
     pub(super) fn index_transaction_inscriptions(
         &mut self,
+        index: &Index,
         tx: &Transaction,
         txid: Txid,
         input_sat_ranges: Option<&VecDeque<(u128, u128)>>,
@@ -178,8 +179,7 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
             let previous_txid_bytes: [u8; 32] = previous_txid.into_inner();
             let mut txids_vec = vec![];
 
-            let txs = vec![tx.clone()];
-            match Inscription::from_transactions(txs) {
+            match Inscription::from_transactions(&tx) {
                 ParsedInscription::None => {
                     // todo: clean up db
                 }
@@ -227,7 +227,36 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
                                     // TODO:
                                 }
                                 Ok(InscriptionOp::Transfer) => {
-                                    // TODO:
+                                    let mut drc = "".to_string();
+                                    if let Some(tick) = object.get("tick") {
+                                        let tick = tick.to_string();
+                                        drc = tick.trim_matches('"').to_string();
+                                    }
+
+                                    let mut amount: u128 = 0;
+                                    if let Some(amt) = object.get("amt") {
+                                        let amt_str = amt.to_string();
+                                        let amt_str = amt_str.trim_matches('"');
+                                        amount = amt_str.parse().unwrap();
+                                    }
+
+                                    if let Some((src, dsts)) =
+                                        Self::drc_transfer_parse(tx, index).unwrap()
+                                    {
+                                        for dst in dsts {
+                                            match index.transfer_drc(
+                                                drc.as_str(),
+                                                src.as_str(),
+                                                dst.as_str(),
+                                                amount,
+                                            ) {
+                                                Ok(()) => {}
+                                                Err(e) => {
+                                                    println!("{}", e)
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 Ok(InscriptionOp::Create) => {
                                     let mut tick0 = "".to_string();
@@ -241,17 +270,14 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
                                         let tick = tick.to_string();
                                         tick1 = tick.trim_matches('"').to_string();
                                     }
-                                    if tick0.is_empty() == false && tick1.is_empty() == false {
-                                        let mut hasher = Sha256::new();
-                                        hasher.update(tick0 + &tick1);
-                                        let id = u64::from_ne_bytes(
-                                            hasher.finalize()[0..8].try_into().unwrap(),
-                                        );
-
-                                        if self.id_to_dex.get(id)?.is_none() {
-                                            self.id_to_dex.insert(id, (self.height, 0, 0, 0))?;
+                                    match index.get_dex_id(&tick0, &tick1) {
+                                        None => {}
+                                        Some(id) => {
+                                            if self.id_to_dex.get(id)?.is_none() {
+                                                self.id_to_dex
+                                                    .insert(id, (self.height, 0, 0, 0))?;
+                                            }
                                         }
-                                        //let result: &[u8; 8] = &result[0..8];
                                     }
                                 }
                                 Ok(InscriptionOp::Add) => {
@@ -277,28 +303,38 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
                                         let amt_str = amt_str.trim_matches('"');
                                         amt1 = amt_str.parse().unwrap();
                                     }
-                                    if tick0.is_empty() == false
-                                        && tick1.is_empty() == false
-                                        && amt0 != 0
-                                        && amt1 != 0
-                                    {
-                                        let mut hasher = Sha256::new();
-                                        hasher.update(tick0 + &tick1);
-                                        let id = u64::from_ne_bytes(
-                                            hasher.finalize()[0..8].try_into().unwrap(),
-                                        );
-
-                                        if let Some(state) = self.id_to_dex.get(id)? {
-                                            let mut state = state.value();
-                                            Self::add_liquidity(
-                                                amt0,
-                                                amt1,
-                                                &mut state.2,
-                                                &mut state.3,
-                                            );
-                                            state.0 = self.height;
-                                            state.1 += 1;
-                                            //self.id_to_dex.insert(id, state)?;
+                                    let addr = Self::drc_add_parse(&tx);
+                                    match index.get_dex_id(&tick0, &tick1) {
+                                        None => {}
+                                        Some(id) => {
+                                            if amt0 != 0 && amt1 != 0 {
+                                                if let Some(mut state) =
+                                                    Index::id_to_dex(index, id).unwrap()
+                                                {
+                                                    let liquidity = Self::add_liquidity(
+                                                        amt0,
+                                                        amt1,
+                                                        &mut state.2,
+                                                        &mut state.3,
+                                                    );
+                                                    state.0 = self.height;
+                                                    state.1 += 1;
+                                                    self.id_to_dex.insert(id, state)?;
+                                                    if let Some(dex) =
+                                                        index.get_dex_name(&tick0, &tick1)
+                                                    {
+                                                        index
+                                                            .insert_drc_act(
+                                                                dex.0.as_str(),
+                                                                &DexInscription {
+                                                                    addr: (addr),
+                                                                    amt: (liquidity),
+                                                                },
+                                                            )
+                                                            .unwrap();
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -325,46 +361,82 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
                                         let amt_str = amt_str.trim_matches('"');
                                         amt1 = amt_str.parse().unwrap();
                                     }
-                                    if tick0.is_empty() == false
-                                        && tick1.is_empty() == false
-                                        && amt0 != 0
-                                        && amt1 != 0
-                                    {
-                                        let mut hasher = Sha256::new();
-                                        hasher.update(tick0.clone() + &tick1);
-                                        let id = u64::from_ne_bytes(
-                                            hasher.finalize()[0..8].try_into().unwrap(),
-                                        );
-                                        if let Some(state) = self.id_to_dex.get(id)? {
-                                            let mut state = state.value();
-                                            let amtOut =
-                                                Self::swap(amt0, &mut state.2, &mut state.3);
-                                            if amt1 > amtOut {
-                                                state.0 = self.height;
-                                                state.1 += 1;
-                                                //self.id_to_dex.insert(id, state)?;
-                                            }
-                                        } else {
-                                            let mut hasher = Sha256::new();
-                                            hasher.update(tick1 + &tick0);
-                                            let id = u64::from_ne_bytes(
-                                                hasher.finalize()[0..8].try_into().unwrap(),
-                                            );
-                                            if let Some(state) = self.id_to_dex.get(id)? {
-                                                let mut state = state.value();
-                                                let amtOut =
-                                                    Self::swap(amt1, &mut state.3, &mut state.2);
-                                                if amt0 > amtOut {
-                                                    state.0 = self.height;
-                                                    state.1 += 1;
-                                                    //self.id_to_dex.insert(id, state)?;
+                                    let addr = Self::drc_add_parse(&tx);
+                                    match index.get_dex_id(&tick0, &tick1) {
+                                        None => {}
+                                        Some(id) => {
+                                            if let Some(mut state) =
+                                                Index::id_to_dex(index, id).unwrap()
+                                            {
+                                                if let Some(dex) =
+                                                    index.get_dex_name(&tick0, &tick1)
+                                                {
+                                                    if dex.1 {
+                                                        let amt_out = Self::swap(
+                                                            amt0,
+                                                            &mut state.2,
+                                                            &mut state.3,
+                                                        );
+                                                        if amt1 > amt_out {
+                                                            state.0 = self.height;
+                                                            state.1 += 1;
+                                                            self.id_to_dex.insert(id, state)?;
+                                                        }
+                                                    } else {
+                                                        let amt_out = Self::swap(
+                                                            amt1,
+                                                            &mut state.3,
+                                                            &mut state.2,
+                                                        );
+                                                        if amt0 > amt_out {
+                                                            state.0 = self.height;
+                                                            state.1 += 1;
+                                                            self.id_to_dex.insert(id, state)?;
+                                                        }
+                                                    }
                                                 }
-                                                //self.id_to_dex.insert(id, state)?;
                                             }
                                         }
                                     }
                                 }
-                                Ok(InscriptionOp::Burn) => {}
+                                Ok(InscriptionOp::Burn) => {
+                                    let mut tick0 = "".to_string();
+                                    let mut tick1: String = "".to_string();
+                                    let mut amount: u128 = 0;
+
+                                    if let Some(tick) = object.get("tick0") {
+                                        let tick = tick.to_string();
+                                        tick0 = tick.trim_matches('"').to_string();
+                                    }
+                                    if let Some(tick) = object.get("tick1") {
+                                        let tick = tick.to_string();
+                                        tick1 = tick.trim_matches('"').to_string();
+                                    }
+                                    if let Some(amt) = object.get("amt0") {
+                                        let amt_str = amt.to_string();
+                                        let amt_str = amt_str.trim_matches('"');
+                                        amount = amt_str.parse().unwrap();
+                                    }
+                                    let addr = Self::drc_burn_parse(&tx);
+                                    if let Some(id) = index.get_dex_id(&tick0, &tick1) {
+                                        if let Some(drc) = index.get_dex_name(&tick0, &tick1) {
+                                            let liquidity =
+                                                index.get_drc_amt(&drc.0, &addr).unwrap().unwrap();
+                                            if let Some(mut state) =
+                                                Index::id_to_dex(index, id).unwrap()
+                                            {
+                                                if amount < liquidity {
+                                                    let (amt0, amt1) = Self::remove_liquidity(
+                                                        liquidity,
+                                                        &mut state.2,
+                                                        &mut state.3,
+                                                    );
+                                                    self.id_to_dex.insert(id, state)?;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 Err(_) => {}
                             }
                         }
@@ -506,16 +578,76 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
         Ok(())
     }
 
-    fn checksum(data: &[u8]) -> Vec<u8> {
-        Sha256::digest(&Sha256::digest(&data)).to_vec()
+    fn drc_transfer_parse(
+        tx: &Transaction,
+        index: &Index,
+    ) -> Result<Option<(String, Vec<String>)>> {
+        let input_num = tx.input.len();
+        let output_num = tx.output.len();
+
+        let mut dsts = Vec::new();
+        if input_num > 2 || input_num == 0 {
+            // not transfer format
+            return Ok(None);
+        }
+        if input_num == 2 && output_num == 5 {
+            let src = match Inscription::addr_from_pkscript(&tx.output[1].script_pubkey).unwrap() {
+                Some(src) => src,
+                None => return Ok(None),
+            };
+
+            if let Some(dst) = Inscription::addr_from_pkscript(&tx.output[0].script_pubkey).unwrap()
+            {
+                dsts.push(dst.clone());
+            }
+            if let Some(mdr) = Inscription::addr_from_pkscript(&tx.output[0].script_pubkey).unwrap()
+            {
+                if mdr != "D87Nj1x9H4oczq5Kmb1jxhxpcqx2vELkqh".to_string() {
+                    return Ok(None);
+                }
+            }
+            // not transfer format
+            return Ok(Some((src, dsts)));
+        }
+        if input_num == 1 {
+            // normal transfer standard
+            let src = match index
+                .get_transaction(tx.input[0].previous_output.txid)?
+                .and_then(|tx| {
+                    Inscription::addr_from_sigscript(&tx.input[0].script_sig.clone()).unwrap()
+                }) {
+                Some(addr) => addr,
+                None => return Ok(None),
+            };
+            for tx_out in &tx.output {
+                if tx_out.value == 100000 {
+                    if let Some(dst) =
+                        Inscription::addr_from_pkscript(&tx_out.script_pubkey).unwrap()
+                    {
+                        dsts.push(dst);
+                    }
+                }
+            }
+            return Ok(Some((src, dsts)));
+        }
+
+        Ok(None)
     }
+    fn drc_add_parse(tx: &Transaction) -> String {
+        //todo:
+        "".to_string()
+    }
+    fn drc_burn_parse(tx: &Transaction) -> String {
+        //todo:
+        "".to_string()
+    }
+
     fn script_to_address(script: &Script) -> [u8; 25] {
         let mut address = [0u8; 25];
         let script_vec = script.as_bytes();
         if script.is_p2pkh() {
             address[0] = 0x1e;
             address[1..21].copy_from_slice(&script_vec[3..23]);
-            //let sum = &Self::checksum(&address[0..21])[0..4];
             let sum = &Sha256::digest(&Sha256::digest(&address[0..21])).to_vec()[0..4];
             address[21..25].copy_from_slice(sum);
             address
