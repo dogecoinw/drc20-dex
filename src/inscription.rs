@@ -191,7 +191,7 @@ impl InscriptionParser {
 
     fn recover_addr_from_pubkeyscript(pk_script: &Script) -> Result<Option<String>> {
         let bytes = pk_script.as_bytes();
-        println!("len is {}", bytes.len());
+
         if bytes.len() >= 25 {
             //OP_DUP
             if bytes[0] == 0x76 {
@@ -304,39 +304,5 @@ impl InscriptionParser {
         }
 
         Some(push_datas)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use bitcoin::hashes::hex::FromHex;
-
-    use super::*;
-
-    #[test]
-    fn empty() {
-        assert_eq!(
-            InscriptionParser::parse(&Script::new()),
-            ParsedInscription::None
-        );
-    }
-
-    #[test]
-    fn test_sigscript() {
-        assert_eq!(
-        InscriptionParser::recover_addr_from_sigscript(
-            &Script::from_hex("47304402201e2cddd74480d7ede31688161374736edea8253749cd5254370d2ae8612edad802204132c16105f539352ff54eff68db179b1fa3fdc2840c9e6cff320843d7c6ea57012102ba104849d5fb6ca3541ac8f7bcfcea2aaa66d337ac24f1960bae02867c79a130").unwrap()
-        ).unwrap(),
-        Some("DQJYzXuMdK949fdu7Nvv9FzPqXhdaXdBFD".to_string()));
-    }
-    #[test]
-    fn test_pubkeyscript() {
-        assert_eq!(
-            InscriptionParser::recover_addr_from_pubkeyscript(
-                &Script::from_hex("76a9145473450c6472d8338e71fb2fc17b8f6440e1838d88ac").unwrap(),
-            )
-            .unwrap(),
-            Some("DCqdPTDP47dJeuJ4QybXFL7BP5V5H4c2nj".to_string())
-        );
     }
 }

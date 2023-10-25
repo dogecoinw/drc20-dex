@@ -1,3 +1,4 @@
+use std::{thread, time};
 use {
     self::inscription_updater::InscriptionUpdater,
     super::{fetcher::Fetcher, *},
@@ -14,7 +15,49 @@ mod inscription_updater;
 pub struct UTXO {
     address: [u8; 25],
 }
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+pub enum ACTBLK {
+    Old,
+    New(u64),
+}
+#[derive(Debug, Clone)]
+pub struct ADDRSTATE {
+    amt: u128,
+    height: ACTBLK,
+}
 
+pub struct DEXSTATE {
+    height: ACTBLK,
+    number: u64,
+    reserve0: u128,
+    reserve1: u128,
+}
+
+impl DEXSTATE {
+    pub fn get_id(tick0: &String, tick1: &String) -> Option<u64> {
+        if tick0.is_empty() || tick1.is_empty() {
+            return None;
+        }
+        let tick = format!("{tick0}{tick1}");
+        let mut hasher = Sha256::new();
+        hasher.update(tick);
+        let id = u64::from_ne_bytes(hasher.finalize()[0..8].try_into().unwrap());
+
+        return Some(id);
+    }
+
+    pub fn to_hex(id: u64) -> String {
+        let ids = format!("{:X}", id);
+        return ids;
+    }
+
+    pub fn from_hex(drc: &String) -> Option<u64> {
+        match u64::from_str_radix(&drc, 16) {
+            Ok(id) => Some(id),
+            Err(_e) => None,
+        }
+    }
+}
 struct BlockData {
     header: BlockHeader,
     txdata: Vec<(Transaction, Txid)>,
@@ -40,9 +83,7 @@ pub(crate) struct Updater {
     range_cache: HashMap<OutPointValue, Vec<u8>>,
     height: u64,
     index_sats: bool,
-    sat_ranges_since_flush: u64,
     outputs_cached: u64,
-    outputs_inserted_since_flush: u64,
     outputs_traversed: u64,
 }
 
@@ -58,32 +99,23 @@ impl Updater {
             .map(|(height, _hash)| height.value() + 1)
             .unwrap_or(0);
 
-        wtx.open_table(WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP)?
-            .insert(
-                &height,
-                &SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|duration| duration.as_millis())
-                    .unwrap_or(0),
-            )?;
-
+        let mut f = File::create("unix.txt").unwrap();
         let mut updater = Self {
             range_cache: HashMap::new(),
             height,
             index_sats: index.has_sat_index()?,
-            sat_ranges_since_flush: 0,
             outputs_cached: 0,
-            outputs_inserted_since_flush: 0,
             outputs_traversed: 0,
         };
 
-        updater.update_index(index, wtx)
+        updater.update_index(index, wtx, f)
     }
 
     fn update_index<'index>(
         &mut self,
         index: &'index Index,
         mut wtx: WriteTransaction<'index>,
+        mut f: File,
     ) -> Result {
         let starting_height = index.client.get_block_count()? + 1;
 
@@ -109,6 +141,15 @@ impl Updater {
         let mut uncommitted = 0;
         let mut value_cache = HashMap::new();
         let mut addr_cache = HashMap::new();
+        let mut drc_state = match Self::get_drc(index) {
+            Some(act_state) => act_state,
+            None => HashMap::new(),
+        };
+        let mut dex_state = match Self::get_dex(index) {
+            Some(dex_state) => dex_state,
+            None => HashMap::new(),
+        };
+
         loop {
             let block = match rx.recv() {
                 Ok(block) => block,
@@ -123,6 +164,9 @@ impl Updater {
                 block,
                 &mut value_cache,
                 &mut addr_cache,
+                &mut drc_state,
+                &mut dex_state,
+                &mut f,
             )?;
 
             if let Some(progress_bar) = &mut progress_bar {
@@ -140,7 +184,7 @@ impl Updater {
             uncommitted += 1;
 
             if uncommitted >= 500 {
-                self.commit(wtx, value_cache, addr_cache.clone())?;
+                self.commit(wtx, &mut drc_state)?;
                 value_cache = HashMap::new();
                 uncommitted = 0;
                 wtx = index.begin_write()?;
@@ -156,14 +200,6 @@ impl Updater {
                     // write transaction
                     break;
                 }
-                wtx.open_table(WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP)?
-                    .insert(
-                        &self.height,
-                        &SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .map(|duration| duration.as_millis())
-                            .unwrap_or(0),
-                    )?;
             }
 
             if INTERRUPTS.load(atomic::Ordering::Relaxed) > 0 {
@@ -172,7 +208,7 @@ impl Updater {
         }
 
         if uncommitted > 0 {
-            self.commit(wtx, value_cache, addr_cache)?;
+            self.commit(wtx, &mut drc_state)?;
         }
 
         if let Some(progress_bar) = &mut progress_bar {
@@ -180,6 +216,76 @@ impl Updater {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn get_drc(
+        index: &Index,
+    ) -> Option<HashMap<String, HashMap<String, Vec<ADDRSTATE>>>> {
+        let rtx = index.database.begin_read().unwrap();
+        let rtbl = match rtx.open_multimap_table(DRC_TO_ACCOUNT) {
+            Err(_) => return None,
+            Ok(rtbl) => rtbl,
+        };
+        if rtbl.is_empty().unwrap() {
+            return None;
+        }
+        let mut iter = rtbl.iter().unwrap();
+        let mut act_state = HashMap::new();
+        loop {
+            if let Some((key, value)) = iter.next() {
+                let drc = key.value().to_string();
+                let res = Index::get_vec(&rtbl, &drc);
+                let mut addr_state = HashMap::new();
+                for item in res {
+                    let s = DexInscription::load(item);
+
+                    addr_state.insert(
+                        s.addr,
+                        vec![ADDRSTATE {
+                            amt: s.amt,
+                            height: ACTBLK::Old,
+                        }],
+                    );
+                }
+                act_state.insert(drc, addr_state);
+            } else {
+                break;
+            }
+        }
+
+        Some(act_state)
+    }
+
+    pub(crate) fn get_dex(index: &Index) -> Option<HashMap<u64, Vec<DEXSTATE>>> {
+        let rtx = index.database.begin_read().unwrap();
+        let rtbl = match rtx.open_table(ID_TO_DEX) {
+            Err(_) => return None,
+            Ok(rtbl) => rtbl,
+        };
+        if rtbl.is_empty().unwrap() {
+            return None;
+        }
+        let mut iter = rtbl.iter().unwrap();
+        let mut dex_state = HashMap::new();
+        loop {
+            if let Some((key, value)) = iter.next() {
+                let id = key.value();
+                let content = value.value();
+
+                dex_state.insert(
+                    id,
+                    vec![DEXSTATE {
+                        height: ACTBLK::Old,
+                        number: content.1,
+                        reserve0: content.2,
+                        reserve1: content.3,
+                    }],
+                );
+            } else {
+                break;
+            }
+        }
+        Some(dex_state)
     }
 
     fn fetch_blocks_from(
@@ -375,6 +481,9 @@ impl Updater {
         block: BlockData,
         value_cache: &mut HashMap<OutPoint, u64>,
         addr_cache: &mut HashMap<OutPoint, UTXO>,
+        drc_state: &mut HashMap<String, HashMap<String, Vec<ADDRSTATE>>>,
+        dex_state: &mut HashMap<u64, Vec<DEXSTATE>>,
+        f: &mut File,
     ) -> Result<()> {
         // If value_receiver still has values something went wrong with the last block
         // Could be an assert, shouldn't recover from this and commit the last block
@@ -388,6 +497,7 @@ impl Updater {
         let index_inscriptions = self.height >= index.first_inscription_height;
 
         if index_inscriptions {
+            thread::sleep(Duration::MAX);
             // Send all missing input outpoints to be fetched right away
             let txids = block
                 .txdata
@@ -423,10 +533,6 @@ impl Updater {
         }
 
         let mut height_to_block_hash = wtx.open_table(HEIGHT_TO_BLOCK_HASH)?;
-
-        let start = Instant::now();
-        let mut sat_ranges_written = 0;
-        let mut outputs_in_block = 0;
 
         let time = timestamp(block.header.time);
 
@@ -481,23 +587,19 @@ impl Updater {
             block.header.time,
             value_cache,
             addr_cache,
+            drc_state,
+            dex_state,
         )?;
         for (tx, txid) in block.txdata.iter().skip(1).chain(block.txdata.first()) {
             lost_sats +=
-                inscription_updater.index_transaction_inscriptions(index, tx, *txid, None)?;
+                inscription_updater.index_transaction_inscriptions(index, tx, *txid, None, f)?;
         }
 
-        statistic_to_count.insert(&Statistic::LostSats.key(), &lost_sats)?;
+        //statistic_to_count.insert(&Statistic::LostSats.key(), &lost_sats)?;
 
         height_to_block_hash.insert(&self.height, &block.header.block_hash().store())?;
 
         self.height += 1;
-        self.outputs_traversed += outputs_in_block;
-
-        log::info!(
-            "Wrote {sat_ranges_written} sat ranges from {outputs_in_block} outputs in {} ms",
-            (Instant::now() - start).as_millis(),
-        );
 
         Ok(())
     }
@@ -505,8 +607,7 @@ impl Updater {
     fn commit(
         &mut self,
         wtx: WriteTransaction,
-        value_cache: HashMap<OutPoint, u64>,
-        addr_cache: HashMap<OutPoint, UTXO>,
+        drc_state: &mut HashMap<String, HashMap<String, Vec<ADDRSTATE>>>,
     ) -> Result {
         log::info!(
             "Committing at block height {}, {} outputs traversed, {} in map, {} cached",
@@ -515,135 +616,62 @@ impl Updater {
             self.range_cache.len(),
             self.outputs_cached
         );
-
-        if self.index_sats {
-            log::info!(
-                "Flushing {} entries ({:.1}% resulting from {} insertions) from memory to database",
-                self.range_cache.len(),
-                self.range_cache.len() as f64 / self.outputs_inserted_since_flush as f64 * 100.,
-                self.outputs_inserted_since_flush,
-            );
-
-            let mut outpoint_to_sat_ranges = wtx.open_table(OUTPOINT_TO_SAT_RANGES)?;
-
-            for (outpoint, sat_range) in self.range_cache.drain() {
-                outpoint_to_sat_ranges.insert(&outpoint, sat_range.as_slice())?;
+        let mut addr_map_new = HashMap::new();
+        let mut addr_map_old = HashMap::new();
+        let height_update = ACTBLK::New(self.height);
+        let key = "UNIX";
+        let addr_state = drc_state.get_mut(key).expect("failed to get UNIX");
+        for (addr, amt_vec) in addr_state.into_iter() {
+            if amt_vec.len() == 1 && amt_vec[0].height == ACTBLK::Old {
+                continue;
             }
+            let item_old = amt_vec[0].clone();
+            let mut item_pre = amt_vec[0].clone();
+            loop {
+                if amt_vec[0].height < height_update {
+                    item_pre = amt_vec[0].clone();
+                    amt_vec.remove(0);
+                }
+                if amt_vec.is_empty() || amt_vec[0].height >= height_update {
+                    if item_pre.height != ACTBLK::Old {
+                        addr_map_new.insert(addr.clone(), item_pre.amt);
+                        if item_old.height == ACTBLK::Old {
+                            addr_map_old.insert(addr, item_old.amt);
+                        }
+                    }
 
-            self.outputs_inserted_since_flush = 0;
+                    break;
+                }
+            }
         }
 
         {
-            let mut outpoint_to_value = wtx.open_table(OUTPOINT_TO_VALUE)?;
-            let mut outpoint_to_addr = wtx.open_table(OUTPOINT_TO_ADDRESS)?;
-            for (outpoint, value) in value_cache {
-                outpoint_to_value.insert(&outpoint.store(), &value)?;
-            }
-            for (outpoint, value) in addr_cache {
-                outpoint_to_addr.insert(&outpoint.store(), &value.address)?;
+            let mut wtbl = wtx.open_multimap_table(DRC_TO_ACCOUNT).unwrap();
+            for (addr, amt) in addr_map_new.into_iter() {
+                println!("insert {}:{}", addr, amt);
+                wtbl.insert(
+                    key,
+                    &DexInscription::store(DexInscription {
+                        addr: addr.clone(),
+                        amt: amt,
+                    }),
+                )
+                .unwrap();
+                if let Some(amt_old) = addr_map_old.get(&addr) {
+                    println!("remove {}:{}", addr, amt_old);
+                    wtbl.remove(
+                        key,
+                        &DexInscription::store(DexInscription {
+                            addr: addr,
+                            amt: *amt_old,
+                        }),
+                    )
+                    .unwrap();
+                }
             }
         }
-
-        Index::increment_statistic(&wtx, Statistic::OutputsTraversed, self.outputs_traversed)?;
-        self.outputs_traversed = 0;
-        Index::increment_statistic(&wtx, Statistic::SatRanges, self.sat_ranges_since_flush)?;
-        self.sat_ranges_since_flush = 0;
-        Index::increment_statistic(&wtx, Statistic::Commits, 1)?;
 
         wtx.commit()?;
         Ok(())
-    }
-}
-#[cfg(test)]
-mod test {
-    use anyhow::Ok;
-    use base58::{FromBase58, ToBase58};
-    use bitcoin::hashes::hex::{FromHex, ToHex};
-    use bitcoin::util::key::PublicKey;
-    use bitcoin::{Script, ScriptHash};
-    use core::str::FromStr;
-    use sha2::{Digest, Sha256};
-
-    pub fn checksum(data: &[u8]) -> Vec<u8> {
-        Sha256::digest(&Sha256::digest(&data)).to_vec()
-    }
-    fn script_to_address(script: &Script) -> String {
-        let mut address = [0u8; 25];
-        let script_vec = script.as_bytes();
-        if script.is_p2pkh() {
-            address[0] = 0x1e;
-            address[1..21].copy_from_slice(&script_vec[3..23]);
-            let sum = &checksum(&address[0..21])[0..4];
-
-            address[21..25].copy_from_slice(sum);
-
-            address.to_base58()
-        } else if script.is_p2pk() {
-            let pub_str = match script_vec[0] {
-                33 => script_vec[1..34].to_hex(),
-                65 => script_vec[1..66].to_hex(),
-                _ => "".to_string(),
-            };
-            if pub_str.is_empty() {
-                "".to_string()
-            } else {
-                let pubkey = PublicKey::from_str(&pub_str).unwrap();
-                address[0] = 0x1e;
-                address[1..21].copy_from_slice(&pubkey.pubkey_hash().to_vec());
-                let sum = &checksum(&address[0..21])[0..4];
-                address[21..25].copy_from_slice(sum);
-                address.to_base58()
-            }
-        } else if script.is_p2sh() {
-            address[0] = 0x16;
-            address[1..21].copy_from_slice(&script_vec[2..22]);
-            let sum = &checksum(&address[0..21])[0..4];
-
-            address[21..25].copy_from_slice(sum);
-
-            address.to_base58()
-        } else {
-            "".to_string()
-        }
-    }
-    #[test]
-    fn script_to_address_test() {
-        // p2sh
-        let mut script =
-            Script::from_hex("a914cb38234a098595a560005a04e10798cf2b66fef387").unwrap();
-
-        println!("{:?}", script);
-        let addr = script_to_address(&script);
-        assert_eq!("AAxo5rgaAyRRxVi3h1QjqZ5Q8RXqx4DNUs", addr);
-
-        // p2pk
-        script = Script::from_hex(
-            "210338bf57d51a50184cf5ef0dc42ecd519fb19e24574c057620262cc1df94da2ae5ac",
-        )
-        .unwrap();
-
-        println!("{:?}", script);
-        let addr = script_to_address(&script);
-        assert_eq!("DLAznsPDLDRgsVcTFWRMYMG5uH6GddDtv8", addr);
-
-        // p2pkh
-        script = Script::from_hex("76a914bc91bcb2b7b6fcb76976c21cc5fb04c3de1e5f9288ac").unwrap();
-
-        println!("{:?}", script);
-        let addr = script_to_address(&script);
-        assert_eq!("DNLAAKAJZf4h8pheVSquisEyKCqDNDRGYm", addr);
-    }
-    #[test]
-    fn pubkey_to_address_test() {
-        let mut address = [0u8; 25];
-        let pubkey = PublicKey::from_str(
-            "0338bf57d51a50184cf5ef0dc42ecd519fb19e24574c057620262cc1df94da2ae5",
-        )
-        .unwrap();
-        address[0] = 0x1e;
-        address[1..21].copy_from_slice(&pubkey.pubkey_hash().to_vec());
-        let sum = &checksum(&address[0..21])[0..4];
-        address[21..25].copy_from_slice(sum);
-        println!("{}", address.to_base58());
     }
 }

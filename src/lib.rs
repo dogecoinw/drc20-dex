@@ -36,6 +36,7 @@ use {
         cmp,
         collections::{BTreeMap, HashSet, VecDeque},
         env,
+        ffi::OsString,
         fmt::{self, Display, Formatter},
         fs::{self, File},
         io,

@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use super::*;
 use crate::{
     index::entry::{DexEntry, DexInscription},
@@ -5,7 +7,7 @@ use crate::{
 };
 use num_integer::Roots;
 use serde_json::Value;
-
+use std::error::Error;
 pub(super) struct Flotsam {
     inscription_id: InscriptionId,
     offset: u64,
@@ -23,7 +25,7 @@ enum InscriptionOp {
     Mint,
     Transfer,
     Add,
-    Burn,
+    Remove,
     Swap,
 }
 
@@ -32,15 +34,96 @@ impl FromStr for InscriptionOp {
 
     fn from_str(input: &str) -> Result<InscriptionOp, Self::Err> {
         match input {
-            "create" => Ok(InscriptionOp::Create),
-            "mint" => Ok(InscriptionOp::Mint),
-            "transfer" => Ok(InscriptionOp::Transfer),
-            "add" => Ok(InscriptionOp::Add),
-            "burn" => Ok(InscriptionOp::Burn),
-            "swap" => Ok(InscriptionOp::Swap),
+            "\"create\"" => Ok(InscriptionOp::Create),
+            "\"mint\"" => Ok(InscriptionOp::Mint),
+            "\"transfer\"" => Ok(InscriptionOp::Transfer),
+            "\"add\"" => Ok(InscriptionOp::Add),
+            "\"remove\"" => Ok(InscriptionOp::Remove),
+            "\"swap\"" => Ok(InscriptionOp::Swap),
             _ => Err(()),
         }
     }
+}
+
+fn drc_mint_parse(tx: &Transaction, amount: u128) -> Result<(String, u128), Box<dyn Error>> {
+    let input_num = tx.input.len();
+    let output_num = tx.output.len();
+    if input_num != 1 || output_num != 2 {
+        return Err("only support one input and two output type")?;
+    }
+    let mint_addr = match Inscription::addr_from_pkscript(&tx.output[0].script_pubkey).unwrap() {
+        Some(addr) => addr,
+        None => return Err("failed to convert mint addr from pk_script")?,
+    };
+    let mint_times = tx.output[0].value / 100000;
+    if mint_times > 30 {
+        return Err("mint times need less than 30")?;
+    }
+
+    let mint_amt = amount * mint_times as u128;
+
+    let manager_addr = match Inscription::addr_from_pkscript(&tx.output[1].script_pubkey).unwrap() {
+        Some(addr) => addr,
+        None => return Err("failed to convert manager addr from pk_script")?,
+    };
+    if manager_addr != "D92uJjQ9eHUcv2GjJUgp6m58V8wYvGV2g9".to_string() {
+        return Err("manager address is wrong")?;
+    }
+
+    if tx.output[1].value < 50000000 * mint_times {
+        return Err("total fee is wrong")?;
+    }
+
+    Ok((mint_addr, mint_amt))
+}
+
+fn drc_transfer_parse(
+    tx: &Transaction,
+    index: &Index,
+) -> Result<(String, Vec<String>), Box<dyn Error>> {
+    let input_num = tx.input.len();
+    let output_num = tx.output.len();
+
+    let mut dsts = Vec::new();
+
+    if input_num == 2 && output_num == 5 {
+        let src = match Inscription::addr_from_pkscript(&tx.output[1].script_pubkey).unwrap() {
+            Some(src) => src,
+            None => return Err("failed to convert addr from pk_script")?,
+        };
+
+        if let Some(dst) = Inscription::addr_from_pkscript(&tx.output[0].script_pubkey).unwrap() {
+            dsts.push(dst.clone());
+        }
+        if let Some(mdr) = Inscription::addr_from_pkscript(&tx.output[3].script_pubkey).unwrap() {
+            if mdr != "D87Nj1x9H4oczq5Kmb1jxhxpcqx2vELkqh".to_string() {
+                return Err("manager addr is wrong")?;
+            }
+        }
+        // not transfer format
+        return Ok((src, dsts));
+    }
+    if input_num == 1 {
+        // normal transfer standard
+        let src = match index
+            .get_transaction(tx.input[0].previous_output.txid)?
+            .and_then(|tx| {
+                Inscription::addr_from_sigscript(&tx.input[0].script_sig.clone()).unwrap()
+            }) {
+            Some(addr) => addr,
+            None => return Err("failed to convert addr from pk_script")?,
+        };
+        for tx_out in &tx.output {
+            if tx_out.value == 100000 {
+                if let Some(dst) = Inscription::addr_from_pkscript(&tx_out.script_pubkey).unwrap() {
+                    dsts.push(dst);
+                }
+            }
+        }
+        return Ok((src, dsts));
+    }
+
+    return Err("format of tx doesn't support")?;
 }
 
 pub(super) struct InscriptionUpdater<'a, 'db, 'tx> {
@@ -64,6 +147,8 @@ pub(super) struct InscriptionUpdater<'a, 'db, 'tx> {
     timestamp: u32,
     value_cache: &'a mut HashMap<OutPoint, u64>,
     addr_cache: &'a mut HashMap<OutPoint, UTXO>,
+    drc_state: &'a mut HashMap<String, HashMap<String, Vec<ADDRSTATE>>>,
+    dex_state: &'a mut HashMap<u64, Vec<DEXSTATE>>,
 }
 
 impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
@@ -95,6 +180,8 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
         timestamp: u32,
         value_cache: &'a mut HashMap<OutPoint, u64>,
         addr_cache: &'a mut HashMap<OutPoint, UTXO>,
+        drc_state: &'a mut HashMap<String, HashMap<String, Vec<ADDRSTATE>>>,
+        dex_state: &'a mut HashMap<u64, Vec<DEXSTATE>>,
     ) -> Result<Self> {
         let next_number = number_to_id
             .iter()?
@@ -124,6 +211,8 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
             timestamp,
             value_cache,
             addr_cache,
+            drc_state,
+            dex_state,
         })
     }
 
@@ -133,6 +222,7 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
         tx: &Transaction,
         txid: Txid,
         input_sat_ranges: Option<&VecDeque<(u128, u128)>>,
+        f: &mut File,
     ) -> Result<u64> {
         let mut inscriptions = Vec::new();
 
@@ -174,17 +264,322 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
             }
         }
 
-        if inscriptions.iter().all(|flotsam| flotsam.offset != 0) {
-            let previous_txid = tx.input[0].previous_output.txid;
-            let previous_txid_bytes: [u8; 32] = previous_txid.into_inner();
-            let mut txids_vec = vec![];
+        match Inscription::from_transactions(&tx) {
+            ParsedInscription::None => {
+                // todo: clean up db
+            }
 
-            match Inscription::from_transactions(&tx) {
-                ParsedInscription::None => {
-                    // todo: clean up db
+            ParsedInscription::Complete(inscription) => {
+                let mut b_record = false;
+                let content_str = inscription.content_type().unwrap().to_string();
+                if content_str == "text/plain;charset=utf-8" {
+                    let body = String::from_utf8(inscription.body().unwrap().to_vec()).unwrap();
+                    let body_str = &body;
+
+                    let object: Value = serde_json::from_str(body_str).unwrap();
+
+                    if let Some(op) = object.get("op") {
+                        match InscriptionOp::from_str(&op.to_string().to_owned()) {
+                            Ok(InscriptionOp::Mint) => {
+                                match Self::drc_mint_op(&object, tx, self.drc_state) {
+                                    Err(_e) => (),
+                                    Ok((drc, addr, amt)) => {
+                                        /*println!(
+                                            "insert database {} for {} at {}",
+                                            amt,
+                                            addr,
+                                            tx.txid().to_string()
+                                        );
+                                        let buf = format!(
+                                            "{} for {} at {}\n",
+                                            amt,
+                                            addr,
+                                            tx.txid().to_string()
+                                        );
+                                        f.write_all(buf.as_bytes()).unwrap();*/
+                                        let drc_value =
+                                            self.drc_state.get_mut(drc.as_str()).unwrap();
+                                        match drc_value.get_mut(&addr) {
+                                            Some(addr_state) => {
+                                                let amt_pre = addr_state.last().unwrap().amt;
+                                                addr_state.push(ADDRSTATE {
+                                                    amt: amt + amt_pre,
+                                                    height: (ACTBLK::New(self.height)),
+                                                });
+                                            }
+                                            None => {
+                                                drc_value.insert(
+                                                    addr,
+                                                    vec![ADDRSTATE {
+                                                        amt,
+                                                        height: (ACTBLK::New(self.height)),
+                                                    }],
+                                                );
+                                            }
+                                        }
+                                        b_record = true;
+                                    }
+                                }
+                            }
+                            Ok(InscriptionOp::Transfer) => {
+                                match Self::drc_transfer_op(index, &object, tx, &self.drc_state) {
+                                    Ok((drc, src_addr, dsts_addr, amount)) => {
+                                        // println!(
+                                        //     "transfer {} of {} from {} to {:?} ",
+                                        //     amount, drc, src_addr, dsts_addr,
+                                        // );
+                                        // let buf = format!("{}\n", tx.txid().to_string());
+                                        // f.write_all(buf.as_bytes()).unwrap();
+
+                                        let drc_value =
+                                            self.drc_state.get_mut(drc.as_str()).unwrap();
+                                        let mut total_amt = 0;
+                                        for dst_addr in dsts_addr {
+                                            match drc_value.get_mut(&dst_addr) {
+                                                Some(addr_state) => {
+                                                    let amt_pre = addr_state.last().unwrap().amt;
+                                                    addr_state.push(ADDRSTATE {
+                                                        amt: amt_pre + amount,
+                                                        height: (ACTBLK::New(self.height)),
+                                                    })
+                                                }
+                                                None => {
+                                                    drc_value.insert(
+                                                        dst_addr,
+                                                        vec![ADDRSTATE {
+                                                            amt: amount,
+                                                            height: ACTBLK::New(self.height),
+                                                        }],
+                                                    );
+                                                }
+                                            }
+                                            total_amt += amount;
+                                        }
+                                        let src_value = drc_value.get_mut(&src_addr).unwrap();
+                                        src_value.push(ADDRSTATE {
+                                            amt: src_value.last().unwrap().amt - total_amt,
+                                            height: ACTBLK::New(self.height),
+                                        });
+                                        b_record = true;
+                                    }
+                                    Err(_e) => (),
+                                }
+                            }
+                            Ok(InscriptionOp::Create) => match Self::dex_create_op(&object) {
+                                Ok(id) => {
+                                    if self.dex_state.get(&id).is_none() {
+                                        self.dex_state.insert(
+                                            id,
+                                            vec![DEXSTATE {
+                                                height: ACTBLK::New(self.height),
+                                                number: 0,
+                                                reserve0: 0,
+                                                reserve1: 0,
+                                            }],
+                                        );
+                                        let drc_id = DEXSTATE::to_hex(id);
+                                        let account_null = DexInscription::load([0; 41]);
+                                        let mut account_map = HashMap::new();
+                                        account_map.insert(
+                                            account_null.addr,
+                                            vec![ADDRSTATE {
+                                                amt: account_null.amt,
+                                                height: ACTBLK::Old,
+                                            }],
+                                        );
+                                        self.drc_state.insert(drc_id, account_map);
+                                        b_record = true;
+                                    } else {
+                                        println!("the pairs does exist");
+                                    }
+                                }
+                                Err(_e) => (),
+                            },
+                            Ok(InscriptionOp::Add) => match Self::dex_add_op(
+                                &object,
+                                tx,
+                                &self.dex_state,
+                                &self.drc_state,
+                            ) {
+                                Err(_e) => (),
+                                Ok((id, tick0, tick1, amt0, amt1, addr)) => {
+                                    let dex_state_vec = self
+                                        .dex_state
+                                        .get_mut(&id)
+                                        .expect("failed to get dex state");
+                                    let dex_state_last = dex_state_vec
+                                        .last()
+                                        .expect("failed to get current dex state");
+                                    match Self::add_liquidity(
+                                        amt0,
+                                        amt1,
+                                        dex_state_last.reserve0,
+                                        dex_state_last.reserve1,
+                                    ) {
+                                        None => (),
+                                        Some((res0, res1, liq)) => {
+                                            dex_state_vec.push(DEXSTATE {
+                                                height: ACTBLK::New(self.height),
+                                                number: (dex_state_last.number + 1),
+                                                reserve0: (res0),
+                                                reserve1: (res1),
+                                            });
+                                            let drc_state = self
+                                                .drc_state
+                                                .get_mut(&DEXSTATE::to_hex(id))
+                                                .unwrap();
+                                            match drc_state.get_mut(&addr) {
+                                                None => {
+                                                    drc_state.insert(
+                                                        addr,
+                                                        vec![ADDRSTATE {
+                                                            amt: liq,
+                                                            height: ACTBLK::Old,
+                                                        }],
+                                                    );
+                                                }
+                                                Some(addr_vec) => {
+                                                    addr_vec.push(ADDRSTATE {
+                                                        amt: liq,
+                                                        height: ACTBLK::New(self.height),
+                                                    });
+                                                }
+                                            }
+                                            b_record = true;
+                                        }
+                                    }
+                                } //
+                            },
+                            Ok(InscriptionOp::Swap) => match Self::dex_swap_op(
+                                &object,
+                                tx,
+                                &self.dex_state,
+                                &self.drc_state,
+                            ) {
+                                Err(_e) => (),
+                                Ok((id, tick0, tick1, amt0, amt1, addr, b_rev)) => {
+                                    let dex_state_vec: &mut Vec<DEXSTATE> = self
+                                        .dex_state
+                                        .get_mut(&id)
+                                        .expect("failed to get dex state");
+                                    let dex_state_last = dex_state_vec
+                                        .last()
+                                        .expect("failed to get current dex state");
+                                    let amt_in;
+                                    let res0;
+                                    let res1;
+                                    if b_rev == true {
+                                        amt_in = amt1;
+                                        res0 = dex_state_last.reserve1;
+                                        res1 = dex_state_last.reserve0;
+                                    } else {
+                                        amt_in = amt0;
+                                        res0 = dex_state_last.reserve0;
+                                        res1 = dex_state_last.reserve1;
+                                    }
+                                    let [tick0_state, tick1_state] =
+                                        self.drc_state.get_many_mut([&tick0, &tick1]).unwrap();
+                                    let (tick0_vec, tick1_vec) = (
+                                        tick0_state.get_mut(&addr).unwrap(),
+                                        tick1_state.get_mut(&addr).unwrap(),
+                                    );
+
+                                    let tick0_last = tick0_vec.last().unwrap();
+                                    let tick1_last = tick1_vec.last().unwrap();
+                                    match Self::swap(amt_in, res0, res1) {
+                                        None => (),
+                                        Some((amt_out, res0, res1)) => {
+                                            if b_rev == true {
+                                                tick0_vec.push(ADDRSTATE {
+                                                    amt: (tick0_last.amt + amt_out),
+                                                    height: ACTBLK::New(self.height),
+                                                });
+                                                tick0_vec.push(ADDRSTATE {
+                                                    amt: (tick1_last.amt - amt_in),
+                                                    height: ACTBLK::New(self.height),
+                                                });
+                                                dex_state_vec.push(DEXSTATE {
+                                                    height: ACTBLK::New(self.height),
+                                                    number: dex_state_last.number + 1,
+                                                    reserve0: res1,
+                                                    reserve1: res0,
+                                                });
+                                            } else {
+                                                tick0_vec.push(ADDRSTATE {
+                                                    amt: (tick0_last.amt - amt_in),
+                                                    height: ACTBLK::New(self.height),
+                                                });
+                                                tick0_vec.push(ADDRSTATE {
+                                                    amt: (tick1_last.amt + amt_out),
+                                                    height: ACTBLK::New(self.height),
+                                                });
+                                                dex_state_vec.push(DEXSTATE {
+                                                    height: ACTBLK::New(self.height),
+                                                    number: dex_state_last.number + 1,
+                                                    reserve0: res0,
+                                                    reserve1: res1,
+                                                });
+                                            }
+                                            b_record = true;
+                                        }
+                                    }
+                                }
+                            },
+                            Ok(InscriptionOp::Remove) => {
+                                match Self::dex_remove_op(
+                                    &object,
+                                    tx,
+                                    self.dex_state,
+                                    self.drc_state,
+                                ) {
+                                    Err(_e) => (),
+                                    Ok((id, tick0, tick1, addr, liq)) => {
+                                        let dex_state_vec: &mut Vec<DEXSTATE> = self
+                                            .dex_state
+                                            .get_mut(&id)
+                                            .expect("failed to get dex state");
+                                        let dex_state_last = dex_state_vec
+                                            .last()
+                                            .expect("failed to get current dex state");
+                                        let mut res0 = dex_state_last.reserve0;
+                                        let mut res1 = dex_state_last.reserve1;
+                                        let [tick0_state, tick1_state] =
+                                            self.drc_state.get_many_mut([&tick0, &tick1]).unwrap();
+                                        let (tick0_vec, tick1_vec) = (
+                                            tick0_state.get_mut(&addr).unwrap(),
+                                            tick1_state.get_mut(&addr).unwrap(),
+                                        );
+                                        let tick0_last = tick0_vec.last().unwrap();
+                                        let tick1_last = tick1_vec.last().unwrap();
+                                        match Self::remove_liquidity(liq, &mut res0, &mut res1) {
+                                            None => (),
+                                            Some((amt0, amt1)) => {
+                                                tick0_vec.push(ADDRSTATE {
+                                                    amt: (tick0_last.amt + amt0),
+                                                    height: ACTBLK::New(self.height),
+                                                });
+                                                tick1_vec.push(ADDRSTATE {
+                                                    amt: (tick1_last.amt + amt1),
+                                                    height: ACTBLK::New(self.height),
+                                                });
+                                                dex_state_vec.push(DEXSTATE {
+                                                    height: ACTBLK::New(self.height),
+                                                    number: (dex_state_last.number + 1),
+                                                    reserve0: res0,
+                                                    reserve1: res1,
+                                                });
+                                                b_record = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
                 }
-
-                ParsedInscription::Complete(inscription) => {
+                if b_record {
+                    let mut txids_vec = vec![];
                     let mut tx_buf = vec![];
                     tx.consensus_encode(&mut tx_buf)?;
                     self.txid_to_tx
@@ -216,234 +611,9 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
                             input_value - tx.output.iter().map(|txout| txout.value).sum::<u64>(),
                         ),
                     });
-                    let content_str = inscription.content_type().unwrap().to_string();
-                    if content_str == "text/plain;charset=utf-8" {
-                        let body_str =
-                            String::from_utf8(inscription.body().unwrap().to_vec()).unwrap();
-                        let object: Value = serde_json::from_str(&body_str.to_owned()).unwrap();
-                        if let Some(op) = object.get("op") {
-                            match InscriptionOp::from_str(&op.to_string().to_owned()) {
-                                Ok(InscriptionOp::Mint) => {
-                                    // TODO:
-                                }
-                                Ok(InscriptionOp::Transfer) => {
-                                    let mut drc = "".to_string();
-                                    if let Some(tick) = object.get("tick") {
-                                        let tick = tick.to_string();
-                                        drc = tick.trim_matches('"').to_string();
-                                    }
-
-                                    let mut amount: u128 = 0;
-                                    if let Some(amt) = object.get("amt") {
-                                        let amt_str = amt.to_string();
-                                        let amt_str = amt_str.trim_matches('"');
-                                        amount = amt_str.parse().unwrap();
-                                    }
-
-                                    if let Some((src, dsts)) =
-                                        Self::drc_transfer_parse(tx, index).unwrap()
-                                    {
-                                        for dst in dsts {
-                                            match index.transfer_drc(
-                                                drc.as_str(),
-                                                src.as_str(),
-                                                dst.as_str(),
-                                                amount,
-                                            ) {
-                                                Ok(()) => {}
-                                                Err(e) => {
-                                                    println!("{}", e)
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(InscriptionOp::Create) => {
-                                    let mut tick0 = "".to_string();
-                                    let mut tick1: String = "".to_string();
-
-                                    if let Some(tick) = object.get("tick0") {
-                                        let tick = tick.to_string();
-                                        tick0 = tick.trim_matches('"').to_string();
-                                    }
-                                    if let Some(tick) = object.get("tick1") {
-                                        let tick = tick.to_string();
-                                        tick1 = tick.trim_matches('"').to_string();
-                                    }
-                                    match index.get_dex_id(&tick0, &tick1) {
-                                        None => {}
-                                        Some(id) => {
-                                            if self.id_to_dex.get(id)?.is_none() {
-                                                self.id_to_dex
-                                                    .insert(id, (self.height, 0, 0, 0))?;
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(InscriptionOp::Add) => {
-                                    let mut tick0 = "".to_string();
-                                    let mut tick1: String = "".to_string();
-                                    let mut amt0: u128 = 0;
-                                    let mut amt1: u128 = 0;
-                                    if let Some(tick) = object.get("tick0") {
-                                        let tick = tick.to_string();
-                                        tick0 = tick.trim_matches('"').to_string();
-                                    }
-                                    if let Some(tick) = object.get("tick1") {
-                                        let tick = tick.to_string();
-                                        tick1 = tick.trim_matches('"').to_string();
-                                    }
-                                    if let Some(amt) = object.get("amt0") {
-                                        let amt_str = amt.to_string();
-                                        let amt_str = amt_str.trim_matches('"');
-                                        amt0 = amt_str.parse().unwrap();
-                                    }
-                                    if let Some(amt) = object.get("amt1") {
-                                        let amt_str = amt.to_string();
-                                        let amt_str = amt_str.trim_matches('"');
-                                        amt1 = amt_str.parse().unwrap();
-                                    }
-                                    let addr = Self::drc_add_parse(&tx);
-                                    match index.get_dex_id(&tick0, &tick1) {
-                                        None => {}
-                                        Some(id) => {
-                                            if amt0 != 0 && amt1 != 0 {
-                                                if let Some(mut state) =
-                                                    Index::id_to_dex(index, id).unwrap()
-                                                {
-                                                    let liquidity = Self::add_liquidity(
-                                                        amt0,
-                                                        amt1,
-                                                        &mut state.2,
-                                                        &mut state.3,
-                                                    );
-                                                    state.0 = self.height;
-                                                    state.1 += 1;
-                                                    self.id_to_dex.insert(id, state)?;
-                                                    if let Some(dex) =
-                                                        index.get_dex_name(&tick0, &tick1)
-                                                    {
-                                                        index
-                                                            .insert_drc_act(
-                                                                dex.0.as_str(),
-                                                                &DexInscription {
-                                                                    addr: (addr),
-                                                                    amt: (liquidity),
-                                                                },
-                                                            )
-                                                            .unwrap();
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(InscriptionOp::Swap) => {
-                                    let mut tick0 = "".to_string();
-                                    let mut tick1: String = "".to_string();
-                                    let mut amt0: u128 = 0;
-                                    let mut amt1: u128 = 0;
-                                    if let Some(tick) = object.get("tick0") {
-                                        let tick = tick.to_string();
-                                        tick0 = tick.trim_matches('"').to_string();
-                                    }
-                                    if let Some(tick) = object.get("tick1") {
-                                        let tick = tick.to_string();
-                                        tick1 = tick.trim_matches('"').to_string();
-                                    }
-                                    if let Some(amt) = object.get("amt0") {
-                                        let amt_str = amt.to_string();
-                                        let amt_str = amt_str.trim_matches('"');
-                                        amt0 = amt_str.parse().unwrap();
-                                    }
-                                    if let Some(amt) = object.get("amt1") {
-                                        let amt_str = amt.to_string();
-                                        let amt_str = amt_str.trim_matches('"');
-                                        amt1 = amt_str.parse().unwrap();
-                                    }
-                                    let addr = Self::drc_add_parse(&tx);
-                                    match index.get_dex_id(&tick0, &tick1) {
-                                        None => {}
-                                        Some(id) => {
-                                            if let Some(mut state) =
-                                                Index::id_to_dex(index, id).unwrap()
-                                            {
-                                                if let Some(dex) =
-                                                    index.get_dex_name(&tick0, &tick1)
-                                                {
-                                                    if dex.1 {
-                                                        let amt_out = Self::swap(
-                                                            amt0,
-                                                            &mut state.2,
-                                                            &mut state.3,
-                                                        );
-                                                        if amt1 > amt_out {
-                                                            state.0 = self.height;
-                                                            state.1 += 1;
-                                                            self.id_to_dex.insert(id, state)?;
-                                                        }
-                                                    } else {
-                                                        let amt_out = Self::swap(
-                                                            amt1,
-                                                            &mut state.3,
-                                                            &mut state.2,
-                                                        );
-                                                        if amt0 > amt_out {
-                                                            state.0 = self.height;
-                                                            state.1 += 1;
-                                                            self.id_to_dex.insert(id, state)?;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(InscriptionOp::Burn) => {
-                                    let mut tick0 = "".to_string();
-                                    let mut tick1: String = "".to_string();
-                                    let mut amount: u128 = 0;
-
-                                    if let Some(tick) = object.get("tick0") {
-                                        let tick = tick.to_string();
-                                        tick0 = tick.trim_matches('"').to_string();
-                                    }
-                                    if let Some(tick) = object.get("tick1") {
-                                        let tick = tick.to_string();
-                                        tick1 = tick.trim_matches('"').to_string();
-                                    }
-                                    if let Some(amt) = object.get("amt0") {
-                                        let amt_str = amt.to_string();
-                                        let amt_str = amt_str.trim_matches('"');
-                                        amount = amt_str.parse().unwrap();
-                                    }
-                                    let addr = Self::drc_burn_parse(&tx);
-                                    if let Some(id) = index.get_dex_id(&tick0, &tick1) {
-                                        if let Some(drc) = index.get_dex_name(&tick0, &tick1) {
-                                            let liquidity =
-                                                index.get_drc_amt(&drc.0, &addr).unwrap().unwrap();
-                                            if let Some(mut state) =
-                                                Index::id_to_dex(index, id).unwrap()
-                                            {
-                                                if amount < liquidity {
-                                                    let (amt0, amt1) = Self::remove_liquidity(
-                                                        liquidity,
-                                                        &mut state.2,
-                                                        &mut state.3,
-                                                    );
-                                                    self.id_to_dex.insert(id, state)?;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(_) => {}
-                            }
-                        }
-                    }
                 }
             }
-        };
+        }
 
         let is_coinbase = tx
             .input
@@ -578,68 +748,390 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
         Ok(())
     }
 
-    fn drc_transfer_parse(
+    fn drc_mint_op(
+        object: &Value,
         tx: &Transaction,
-        index: &Index,
-    ) -> Result<Option<(String, Vec<String>)>> {
-        let input_num = tx.input.len();
-        let output_num = tx.output.len();
-
-        let mut dsts = Vec::new();
-        if input_num > 2 || input_num == 0 {
-            // not transfer format
-            return Ok(None);
+        drc_state: &HashMap<String, HashMap<String, Vec<ADDRSTATE>>>,
+    ) -> Result<(String, String, u128), Box<dyn Error>> {
+        let mut drc = "".to_string();
+        if let Some(tick) = object.get("tick") {
+            let tick = tick.to_string();
+            drc = tick.trim_matches('"').to_string();
+        } else {
+            return Err("failed to get tick")?;
         }
-        if input_num == 2 && output_num == 5 {
-            let src = match Inscription::addr_from_pkscript(&tx.output[1].script_pubkey).unwrap() {
-                Some(src) => src,
-                None => return Ok(None),
-            };
 
-            if let Some(dst) = Inscription::addr_from_pkscript(&tx.output[0].script_pubkey).unwrap()
-            {
-                dsts.push(dst.clone());
+        let mut amount: u128 = 0;
+        if let Some(amt) = object.get("amt") {
+            let amt_str = amt.to_string();
+            let amt_str = amt_str.trim_matches('"');
+            amount = amt_str.parse().unwrap();
+        } else {
+            println!("amount error");
+            return Err("failed to get amount")?;
+        }
+
+        if !drc_state.get(drc.as_str()).is_none() && amount != 0 {
+            match drc_mint_parse(tx, amount) {
+                Ok((addr, amt)) => return Ok((drc, addr, amt)),
+                Err(e) => return Err(e),
             }
-            if let Some(mdr) = Inscription::addr_from_pkscript(&tx.output[0].script_pubkey).unwrap()
-            {
-                if mdr != "D87Nj1x9H4oczq5Kmb1jxhxpcqx2vELkqh".to_string() {
-                    return Ok(None);
+        } else {
+            return Err("drc20 doesn't exits")?;
+        }
+    }
+
+    fn drc_transfer_op(
+        index: &Index,
+        object: &Value,
+        tx: &Transaction,
+        drc_state: &HashMap<String, HashMap<String, Vec<ADDRSTATE>>>,
+    ) -> Result<(String, String, Vec<String>, u128), Box<dyn Error>> {
+        let mut drc = "".to_string();
+        if let Some(tick) = object.get("tick") {
+            let tick = tick.to_string();
+            drc = tick.trim_matches('"').to_string();
+        } else {
+            return Err("failed to get tick")?;
+        }
+
+        let amount: u128;
+        if let Some(amt) = object.get("amt") {
+            let amt_str = amt.to_string();
+            let amt_str = amt_str.trim_matches('"');
+            amount = amt_str.parse().unwrap();
+        } else {
+            return Err("failed to get amount")?;
+        }
+        let addr_state = drc_state.get(drc.as_str());
+        if !addr_state.is_none() && amount != 0 {
+            match drc_transfer_parse(tx, index) {
+                Ok((src, dsts)) => {
+                    let total_amt = dsts.len() as u128 * amount;
+
+                    match addr_state.unwrap().get(&src) {
+                        None => Err("src doesn't exits")?,
+                        Some(addr_vec) => {
+                            if addr_vec.last().unwrap().amt >= total_amt {
+                                return Ok((drc, src, dsts, amount));
+                            } else {
+                                return Err("balance of src is not enough")?;
+                            }
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            return Err("drc20 doesn't exits")?;
+        }
+    }
+
+    fn dex_create_op(object: &Value) -> Result<u64, Box<dyn Error>> {
+        let mut tick0 = "".to_string();
+        let mut tick1: String = "".to_string();
+
+        if let Some(tick) = object.get("tick0") {
+            let tick = tick.to_string();
+            tick0 = tick.trim_matches('"').to_string();
+        } else {
+            return Err("failed to parse tick0")?;
+        }
+        if let Some(tick) = object.get("tick1") {
+            let tick = tick.to_string();
+            tick1 = tick.trim_matches('"').to_string();
+        } else {
+            return Err("failed to parse tick1")?;
+        }
+        match DEXSTATE::get_id(&tick0, &tick1) {
+            None => {
+                return Err("failed to generate dex id")?;
+            }
+            Some(id) => {
+                return Ok(id);
+            }
+        }
+    }
+
+    fn dex_add_op(
+        object: &Value,
+        tx: &Transaction,
+        dex_state: &HashMap<u64, Vec<DEXSTATE>>,
+        drc_state: &HashMap<String, HashMap<String, Vec<ADDRSTATE>>>,
+    ) -> Result<(u64, String, String, u128, u128, String), Box<dyn Error>> {
+        let mut tick0;
+        let mut tick1: String;
+        let mut amt0: u128;
+        let mut amt1: u128;
+        let id: u64;
+        let mut addr: String = "".to_string();
+        if let Some(tick) = object.get("tick0") {
+            let tick = tick.to_string();
+            tick0 = tick.trim_matches('"').to_string();
+        } else {
+            return Err("failed to parse tick0")?;
+        }
+        if let Some(tick) = object.get("tick1") {
+            let tick = tick.to_string();
+            tick1 = tick.trim_matches('"').to_string();
+        } else {
+            return Err("failed to parse tick1")?;
+        }
+        if let Some(amt) = object.get("amt0") {
+            let amt_str = amt.to_string();
+            let amt_str = amt_str.trim_matches('"');
+            amt0 = amt_str.parse().unwrap();
+        } else {
+            return Err("failed to parse amt0")?;
+        }
+        if let Some(amt) = object.get("amt1") {
+            let amt_str = amt.to_string();
+            let amt_str = amt_str.trim_matches('"');
+            amt1 = amt_str.parse().unwrap();
+        } else {
+            return Err("failed to parse amt1")?;
+        }
+        if let Some(tid) = DEXSTATE::get_id(&tick0, &tick1) {
+            if dex_state.get(&tid).is_none() {
+                if let Some(tid) = DEXSTATE::get_id(&tick1, &tick0) {
+                    std::mem::swap(&mut tick0, &mut tick1);
+                    let amt = amt0;
+                    amt0 = amt1;
+                    amt1 = amt;
+                    if drc_state.get(&DEXSTATE::to_hex(tid)).is_none() {
+                        return Err("liquidity of dex doesn't exist")?;
+                    }
+                    id = tid;
+                } else {
+                    return Err("dex doesn't exist")?;
+                }
+            } else {
+                if drc_state.get(&DEXSTATE::to_hex(tid)).is_none() {
+                    return Err("liquidity of dex doesn't exist")?;
+                }
+                id = tid;
+            }
+        } else {
+            return Err("failed to get dex id")?;
+        }
+        if let Ok(data) = Inscription::addr_from_sigscript(&tx.input[0].script_sig.clone()) {
+            match data {
+                Some(data) => {
+                    addr = data;
+                }
+                None => {
+                    return Err("addr is none")?;
                 }
             }
-            // not transfer format
-            return Ok(Some((src, dsts)));
+        } else {
+            Err("failed to parse address from transaction")?;
         }
-        if input_num == 1 {
-            // normal transfer standard
-            let src = match index
-                .get_transaction(tx.input[0].previous_output.txid)?
-                .and_then(|tx| {
-                    Inscription::addr_from_sigscript(&tx.input[0].script_sig.clone()).unwrap()
-                }) {
-                Some(addr) => addr,
-                None => return Ok(None),
-            };
-            for tx_out in &tx.output {
-                if tx_out.value == 100000 {
-                    if let Some(dst) =
-                        Inscription::addr_from_pkscript(&tx_out.script_pubkey).unwrap()
-                    {
-                        dsts.push(dst);
+        let tick0_state = drc_state.get(tick0.as_str());
+        if !tick0_state.is_none() && amt0 != 0 {
+            match tick0_state.unwrap().get(&addr) {
+                None => Err("src doesn't exits")?,
+                Some(addr_vec) => {
+                    if addr_vec.last().unwrap().amt < amt0 {
+                        return Err("balance of src is not enough")?;
                     }
                 }
             }
-            return Ok(Some((src, dsts)));
+        } else {
+            return Err("something wrong in tick0")?;
+        }
+        let tick1_state = drc_state.get(tick1.as_str());
+        if !tick1_state.is_none() && amt1 != 0 {
+            match tick1_state.unwrap().get(&addr) {
+                None => Err("src doesn't exits")?,
+                Some(addr_vec) => {
+                    if addr_vec.last().unwrap().amt < amt1 {
+                        return Err("balance of src is not enough")?;
+                    }
+                }
+            }
+        } else {
+            return Err("something wrong in tick1")?;
         }
 
-        Ok(None)
+        return Ok((id, tick0, tick1, amt0, amt1, addr));
     }
-    fn drc_add_parse(tx: &Transaction) -> String {
-        //todo:
-        "".to_string()
+
+    fn dex_swap_op(
+        object: &Value,
+        tx: &Transaction,
+        dex_state: &HashMap<u64, Vec<DEXSTATE>>,
+        drc_state: &HashMap<String, HashMap<String, Vec<ADDRSTATE>>>,
+    ) -> Result<(u64, String, String, u128, u128, String, bool), Box<dyn Error>> {
+        let mut tick0;
+        let mut tick1: String;
+        let mut amt0: u128;
+        let mut amt1: u128;
+        let id: u64;
+        let b_rev: bool;
+        let mut addr: String = "".to_string();
+        if let Some(tick) = object.get("tick0") {
+            let tick = tick.to_string();
+            tick0 = tick.trim_matches('"').to_string();
+        } else {
+            return Err("failed to parse tick0")?;
+        }
+        if let Some(tick) = object.get("tick1") {
+            let tick = tick.to_string();
+            tick1 = tick.trim_matches('"').to_string();
+        } else {
+            return Err("failed to parse tick1")?;
+        }
+        if let Some(amt) = object.get("amt0") {
+            let amt_str = amt.to_string();
+            let amt_str = amt_str.trim_matches('"');
+            amt0 = amt_str.parse().unwrap();
+        } else {
+            return Err("failed to parse amt0")?;
+        }
+        if let Some(amt) = object.get("amt1") {
+            let amt_str = amt.to_string();
+            let amt_str = amt_str.trim_matches('"');
+            amt1 = amt_str.parse().unwrap();
+        } else {
+            return Err("failed to parse amt1")?;
+        }
+        if let Some(tid) = DEXSTATE::get_id(&tick0, &tick1) {
+            if dex_state.get(&tid).is_none() {
+                if let Some(tid) = DEXSTATE::get_id(&tick1, &tick0) {
+                    let mut tick = tick0;
+                    tick0 = tick1;
+                    tick1 = tick;
+                    let mut amt = amt0;
+                    amt0 = amt1;
+                    amt1 = amt;
+                    if drc_state.get(&DEXSTATE::to_hex(tid)).is_none() {
+                        return Err("liquidity of dex doesn't exist")?;
+                    }
+                    id = tid;
+                    b_rev = true;
+                } else {
+                    return Err("dex doesn't exist")?;
+                }
+            } else {
+                if drc_state.get(&DEXSTATE::to_hex(tid)).is_none() {
+                    return Err("liquidity of dex doesn't exist")?;
+                }
+                id = tid;
+                b_rev = false;
+            }
+        } else {
+            return Err("failed to get dex id")?;
+        }
+        if let Ok(data) = Inscription::addr_from_sigscript(&tx.input[0].script_sig.clone()) {
+            match data {
+                Some(data) => {
+                    addr = data;
+                }
+                None => {
+                    return Err("addr is none")?;
+                }
+            }
+        } else {
+            Err("failed to parse address from transaction")?;
+        }
+        let tick0_state = drc_state.get(tick0.as_str());
+        if !tick0_state.is_none() && amt0 != 0 {
+            match tick0_state.unwrap().get(&addr) {
+                None => Err("src doesn't exits")?,
+                Some(addr_vec) => {
+                    if addr_vec.last().unwrap().amt < amt0 {
+                        return Err("balance of src is not enough")?;
+                    }
+                }
+            }
+        } else {
+            return Err("something wrong in tick0")?;
+        }
+        let tick1_state = drc_state.get(tick1.as_str());
+        if tick1_state.is_none() {
+            return Err("something wrong in tick1")?;
+        }
+
+        return Ok((id, tick0, tick1, amt0, amt1, addr, b_rev));
     }
-    fn drc_burn_parse(tx: &Transaction) -> String {
-        //todo:
-        "".to_string()
+
+    fn dex_remove_op(
+        object: &Value,
+        tx: &Transaction,
+        dex_state: &HashMap<u64, Vec<DEXSTATE>>,
+        drc_state: &HashMap<String, HashMap<String, Vec<ADDRSTATE>>>,
+    ) -> Result<(u64, String, String, String, u128), Box<dyn Error>> {
+        let mut tick0;
+        let mut tick1: String;
+        let mut liq: u128;
+
+        let id: u64;
+        let b_rev: bool;
+        let mut addr: String = "".to_string();
+        if let Some(tick) = object.get("tick0") {
+            let tick = tick.to_string();
+            tick0 = tick.trim_matches('"').to_string();
+        } else {
+            return Err("failed to parse tick0")?;
+        }
+        if let Some(tick) = object.get("tick1") {
+            let tick = tick.to_string();
+            tick1 = tick.trim_matches('"').to_string();
+        } else {
+            return Err("failed to parse tick1")?;
+        }
+        if let Some(amt) = object.get("amt") {
+            let amt_str = amt.to_string();
+            let amt_str = amt_str.trim_matches('"');
+            liq = amt_str.parse().unwrap();
+        } else {
+            return Err("failed to parse amt")?;
+        }
+
+        if let Some(tid) = DEXSTATE::get_id(&tick0, &tick1) {
+            if dex_state.get(&tid).is_none() {
+                if let Some(tid) = DEXSTATE::get_id(&tick1, &tick0) {
+                    let mut tick = tick0;
+                    tick0 = tick1;
+                    tick1 = tick;
+
+                    id = tid;
+                } else {
+                    return Err("dex doesn't exist")?;
+                }
+            } else {
+                id = tid;
+            }
+        } else {
+            return Err("failed to get dex id")?;
+        }
+        if let Ok(data) = Inscription::addr_from_sigscript(&tx.input[0].script_sig.clone()) {
+            match data {
+                Some(data) => {
+                    addr = data;
+                }
+                None => {
+                    return Err("addr is none")?;
+                }
+            }
+        } else {
+            Err("failed to parse address from transaction")?;
+        }
+        let liq_state = drc_state.get(&DEXSTATE::to_hex(id));
+        if !liq_state.is_none() && liq != 0 {
+            match liq_state.unwrap().get(&addr) {
+                None => Err("src doesn't exits")?,
+                Some(addr_vec) => {
+                    if addr_vec.last().unwrap().amt >= liq {
+                        return Err("liquidity of src is not enough")?;
+                    }
+                }
+            }
+        } else {
+            return Err("something wrong in tick0")?;
+        }
+
+        return Ok((id, tick0, tick1, addr, liq));
     }
 
     fn script_to_address(script: &Script) -> [u8; 25] {
@@ -680,25 +1172,33 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
         }
     }
 
-    fn add_liquidity(amt0: u128, amt1: u128, reserve0: &mut u128, reserve1: &mut u128) -> u128 {
+    fn add_liquidity(
+        amt0: u128,
+        amt1: u128,
+        reserve0: u128,
+        reserve1: u128,
+    ) -> Option<(u128, u128, u128)> {
         const MINI_LIQUIDITY: u128 = 100;
-        let liqudity = amt0 * *reserve1 + amt1 * *reserve0 + amt0 * amt1;
+        let liqudity = amt0 * reserve1 + amt1 * reserve0 + amt0 * amt1;
 
-        *reserve0 += amt0;
-        *reserve1 += amt1;
+        let res0 = reserve0 + amt0;
+        let res1 = reserve1 + amt1;
+
         if liqudity < MINI_LIQUIDITY {
-            0
+            None
         } else {
-            liqudity
+            Some((res0, res1, liqudity))
         }
     }
 
-    fn remove_liquidity(liquidity: u128, reserve0: &mut u128, reserve1: &mut u128) -> (u128, u128) {
+    fn remove_liquidity(
+        liquidity: u128,
+        reserve0: &mut u128,
+        reserve1: &mut u128,
+    ) -> Option<(u128, u128)> {
         const MINI_RESERVE: u128 = 10;
         if *reserve0 * *reserve1 <= liquidity {
-            *reserve0 = MINI_RESERVE;
-            *reserve1 = MINI_RESERVE;
-            return (0, 0);
+            None
         } else {
             let amt0 = ((liquidity * *reserve0) / *reserve1).sqrt();
             let amt1 = ((liquidity * *reserve1) / *reserve0).sqrt();
@@ -706,23 +1206,156 @@ impl<'a, 'db, 'tx> InscriptionUpdater<'a, 'db, 'tx> {
             if *reserve0 > amt0 + MINI_RESERVE {
                 *reserve0 -= amt0;
             } else {
-                *reserve0 = MINI_RESERVE;
+                return None;
             }
 
             if *reserve1 > amt1 + MINI_RESERVE {
                 *reserve1 -= amt1;
             } else {
-                *reserve1 = MINI_RESERVE;
+                return None;
             }
 
-            return (amt0, amt1);
+            return Some((amt0, amt1));
         }
     }
 
-    fn swap(amtIn: u128, reserve0: &mut u128, reserve1: &mut u128) -> u128 {
-        let amtOut;
-        amtOut = (amtIn * *reserve1) / (*reserve0 + amtIn);
+    fn swap(amt_in: u128, reserve0: u128, reserve1: u128) -> Option<(u128, u128, u128)> {
+        let amt_out = (amt_in * reserve1) / (reserve0 + amt_in);
+        let res0 = reserve0 + amt_in;
+        if reserve1 > amt_out {
+            let res1 = reserve1 - amt_out;
+            Some((res0, res1, amt_out))
+        } else {
+            None
+        }
+    }
+}
 
-        return amtOut;
+#[cfg(test)]
+mod tests {
+    use {
+        self::index::updater::inscription_updater,
+        super::*,
+        bitcoin::secp256k1::rand::{self, RngCore},
+        tempfile::TempDir,
+    };
+
+    fn index_build() -> Result<Index> {
+        let rpc_url = "39.98.228.222:9141";
+
+        let tempdir = TempDir::new().unwrap();
+        let cookie_file = tempdir.path().join("cookie");
+        fs::write(&cookie_file, "admin:dogewow2023").unwrap();
+
+        let command: Vec<OsString> = vec![
+            "ord".into(),
+            "--rpc-url".into(),
+            rpc_url.into(),
+            "--data-dir".into(),
+            tempdir.path().into(),
+            "--cookie-file".into(),
+            cookie_file.into(),
+        ];
+        let args: Vec<OsString> = Vec::new();
+        let options = Options::try_parse_from(command.into_iter().chain(args)).unwrap();
+        let index = Index::open(&options)?;
+
+        Ok(index)
+    }
+
+    fn empty_map() -> Option<HashMap<String, HashMap<String, Vec<ADDRSTATE>>>> {
+        let mut act_map = HashMap::new();
+        let mut addr_map = HashMap::new();
+        addr_map.insert(
+            "".to_string(),
+            vec![ADDRSTATE {
+                amt: 0,
+                height: ACTBLK::Old,
+            }],
+        );
+        act_map.insert("UNIX".to_string(), addr_map);
+        Some(act_map)
+    }
+
+    #[test]
+    fn test_parse_mint_tx() {
+        let index = index_build().expect("failed to generate index");
+        let tx_str = "f7501f2d8a73db6da05e1d1d8fbea7d450ab0e87b23791562fb3a92a7229efb3";
+        let txid = bitcoin::Txid::from_str(&tx_str).unwrap();
+        let tx = index
+            .client
+            .get_raw_transaction(&txid)
+            .expect("failed to get transaction");
+        match Inscription::from_transactions(&tx) {
+            ParsedInscription::None => println!("failed to get inscription"),
+            ParsedInscription::Complete(inscription) => {
+                let body = String::from_utf8(inscription.body().unwrap().to_vec()).unwrap();
+                let object: Value = serde_json::from_str(&body).unwrap();
+                println!("{:?}", object);
+                let drc_state = empty_map().unwrap();
+                let res = InscriptionUpdater::drc_mint_op(&object, &tx, &drc_state);
+                println!("res: {:?}", res);
+            }
+        }
+    }
+    #[test]
+    fn test_parse_transfer_tx() {
+        let index = index_build().expect("failed to generate index");
+        let tx_str = "685d3b8da7171e9d641da6765a84afc9e4f03297e19a2131c84bae71581df684";
+        let txid = bitcoin::Txid::from_str(&tx_str).unwrap();
+        let tx = index
+            .client
+            .get_raw_transaction(&txid)
+            .expect("failed to get transaction");
+        match Inscription::from_transactions(&tx) {
+            ParsedInscription::None => println!("failed to get inscription"),
+            ParsedInscription::Complete(inscription) => {
+                let body = String::from_utf8(inscription.body().unwrap().to_vec()).unwrap();
+                let object: Value = serde_json::from_str(&body).unwrap();
+                println!("{:?}", object);
+                let mut drc_state = empty_map().unwrap();
+                let mut addr_state = HashMap::new();
+                addr_state.insert(
+                    "D6MsJWXewKcnVXvdbe8VLJAFH98Bmvk9CP".to_string(),
+                    vec![ADDRSTATE {
+                        amt: 3600000,
+                        height: ACTBLK::Old,
+                    }],
+                );
+                drc_state.insert("UNIX".to_string(), addr_state);
+                let (drc, src_addr, dsts_addr, amount) =
+                    InscriptionUpdater::drc_transfer_op(&index, &object, &tx, &drc_state).unwrap();
+                let height = 100;
+                let drc_value = drc_state.get_mut(drc.as_str()).unwrap();
+                let mut total_amt = 0;
+                for dst_addr in dsts_addr {
+                    match drc_value.get_mut(&dst_addr) {
+                        Some(addr_state) => {
+                            let amt_pre = addr_state.last().unwrap().amt;
+                            addr_state.push(ADDRSTATE {
+                                amt: amt_pre + amount,
+                                height: (ACTBLK::New(height)),
+                            })
+                        }
+                        None => {
+                            drc_value.insert(
+                                dst_addr,
+                                vec![ADDRSTATE {
+                                    amt: amount,
+                                    height: ACTBLK::New(height),
+                                }],
+                            );
+                        }
+                    }
+                    total_amt += amount;
+                }
+                let src_value = drc_value.get_mut(&src_addr).unwrap();
+                src_value.push(ADDRSTATE {
+                    amt: src_value.last().unwrap().amt - total_amt,
+                    height: ACTBLK::New(height),
+                });
+                println!("addr_state: {:?}", drc_state.get("UNIX").unwrap());
+            }
+        }
     }
 }

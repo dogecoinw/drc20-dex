@@ -147,8 +147,8 @@ impl Entry for SatRange {
 }
 
 pub(crate) struct DexEntry {
-    pub(crate) block: u64,
-    pub(crate) number: u64,
+    pub(crate) height: u64,
+    pub(crate) id: u64,
     pub(crate) reserve0: u128,
     pub(crate) reserve1: u128,
 }
@@ -157,17 +157,17 @@ pub(crate) type DexEntryValue = (u64, u64, u128, u128);
 
 impl Entry for DexEntry {
     type Value = DexEntryValue;
-    fn load((block, number, reserve0, reserve1): DexEntryValue) -> Self {
+    fn load((height, id, reserve0, reserve1): DexEntryValue) -> Self {
         Self {
-            block,
-            number,
+            height, // block height
+            id,     // dex state number
             reserve0,
             reserve1,
         }
     }
 
     fn store(self) -> Self::Value {
-        (self.block, self.number, self.reserve0, self.reserve1)
+        (self.height, self.id, self.reserve0, self.reserve1)
     }
 }
 
@@ -186,7 +186,7 @@ impl Entry for DexInscription {
         let amt = u128::from_le_bytes(buf);
 
         let mut buf: [u8; 25] = [0; 25];
-        buf[..25].copy_from_slice(&value[32..]);
+        buf[..25].copy_from_slice(&value[16..]);
         let addr = buf.to_base58();
 
         Self {

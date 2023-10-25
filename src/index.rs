@@ -1,9 +1,12 @@
+// #![feature(map_many_mut)]
+// use std::collections::HashMap;
 use crate::inscription::ParsedInscription;
 use std::io::Cursor;
 
 use self::entry::{DexEntryValue, DexInscriptionValue};
 
 use crate::index::entry::*;
+
 use {
     self::{
         entry::{
@@ -17,17 +20,15 @@ use {
     bitcoin::BlockHeader,
     bitcoincore_rpc::{json::GetBlockHeaderResult, Auth, Client},
     chrono::SubsecRound,
+    hashbrown::HashMap,
     indicatif::{ProgressBar, ProgressStyle},
     log::log_enabled,
     redb::{
         Database, MultimapTable, MultimapTableDefinition, ReadableMultimapTable, ReadableTable,
         Table, TableDefinition, WriteStrategy, WriteTransaction,
     },
-    sha2::{Digest, Sha256},
-    std::collections::HashMap,
     std::sync::atomic::{self, AtomicBool},
 };
-
 mod entry;
 mod fetcher;
 mod rtx;
@@ -62,7 +63,6 @@ define_table! { SATPOINT_TO_INSCRIPTION_ID, &SatPointValue, &InscriptionIdValue 
 define_table! { SAT_TO_INSCRIPTION_ID, u128, &InscriptionIdValue }
 define_table! { SAT_TO_SATPOINT, u128, &SatPointValue }
 define_table! { STATISTIC_TO_COUNT, u64, u64 }
-define_table! { WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP, u64, u128 }
 define_table! { ID_TO_DEX, u64, DexEntryValue}
 define_multimap_table! { DRC_TO_ACCOUNT, &str, &DexInscriptionValue}
 
@@ -120,7 +120,6 @@ pub(crate) struct Info {
     pub(crate) page_size: usize,
     pub(crate) sat_ranges: u64,
     pub(crate) stored_bytes: usize,
-    pub(crate) transactions: Vec<TransactionInfo>,
     pub(crate) tree_height: usize,
     pub(crate) utxos_indexed: usize,
 }
@@ -187,19 +186,19 @@ impl Index {
                     .unwrap_or(0);
 
                 match schema_version.cmp(&SCHEMA_VERSION) {
-          cmp::Ordering::Less =>
-            bail!(
-              "index at `{}` appears to have been built with an older, incompatible version of ord, consider deleting and rebuilding the index: index schema {schema_version}, ord schema {SCHEMA_VERSION}",
-              path.display()
-            ),
-          cmp::Ordering::Greater =>
-            bail!(
-              "index at `{}` appears to have been built with a newer, incompatible version of ord, consider updating ord: index schema {schema_version}, ord schema {SCHEMA_VERSION}",
-              path.display()
-            ),
-          cmp::Ordering::Equal => {
-          }
-        }
+                    cmp::Ordering::Less =>
+                        bail!(
+                        "index at `{}` appears to have been built with an older, incompatible version of ord, consider deleting and rebuilding the index: index schema {schema_version}, ord schema {SCHEMA_VERSION}",
+                        path.display()
+                        ),
+                    cmp::Ordering::Greater =>
+                        bail!(
+                        "index at `{}` appears to have been built with a newer, incompatible version of ord, consider updating ord: index schema {schema_version}, ord schema {SCHEMA_VERSION}",
+                        path.display()
+                        ),
+                    cmp::Ordering::Equal => {
+                    }
+                }
 
                 database
             }
@@ -234,7 +233,6 @@ impl Index {
                 tx.open_table(SATPOINT_TO_INSCRIPTION_ID)?;
                 tx.open_table(SAT_TO_INSCRIPTION_ID)?;
                 tx.open_table(SAT_TO_SATPOINT)?;
-                tx.open_table(WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP)?;
 
                 tx.open_table(STATISTIC_TO_COUNT)?
                     .insert(&Statistic::Schema.key(), &SCHEMA_VERSION)?;
@@ -243,7 +241,8 @@ impl Index {
                     tx.open_table(OUTPOINT_TO_SAT_RANGES)?
                         .insert(&OutPoint::null().store(), [].as_slice())?;
                 }
-
+                tx.open_multimap_table(DRC_TO_ACCOUNT)?
+                    .insert("UNIX", &[0; 41])?;
                 tx.commit()?;
 
                 database
@@ -317,16 +316,6 @@ impl Index {
                 outputs_traversed,
                 page_size: stats.page_size(),
                 stored_bytes: stats.stored_bytes(),
-                transactions: wtx
-                    .open_table(WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP)?
-                    .range(0..)?
-                    .map(
-                        |(starting_block_count, starting_timestamp)| TransactionInfo {
-                            starting_block_count: starting_block_count.value(),
-                            starting_timestamp: starting_timestamp.value(),
-                        },
-                    )
-                    .collect(),
                 tree_height: stats.tree_height(),
                 utxos_indexed: wtx.open_table(OUTPOINT_TO_SAT_RANGES)?.len()?,
             }
@@ -839,7 +828,7 @@ impl Index {
         Ok(None)
     }
 
-    fn get_vec(
+    pub(crate) fn get_vec(
         table: &impl ReadableMultimapTable<&'static str, &'static DexInscriptionValue>,
         key: &str,
     ) -> Vec<DexInscriptionValue> {
@@ -853,25 +842,6 @@ impl Index {
                 return result;
             }
         }
-    }
-    pub(crate) fn insert_drc_act(
-        &self,
-        key: &str,
-        entry: &DexInscription,
-    ) -> Result<(), &'static str> {
-        let wtx = self.database.begin_write().unwrap();
-        {
-            let mut wtbl = wtx.open_multimap_table(DRC_TO_ACCOUNT).unwrap();
-            wtbl.insert(
-                key,
-                &DexInscription::store(DexInscription {
-                    addr: (entry.addr.clone()),
-                    amt: (entry.amt),
-                }),
-            )
-            .unwrap();
-        }
-        Ok(())
     }
 
     pub(crate) fn transfer_drc(
@@ -896,7 +866,7 @@ impl Index {
         let res = Self::get_vec(&rtbl, key);
         if !res.is_empty() {
             let mut b_src = false;
-            let mut b_dst = false;
+            let b_dst = false;
             let mut src_act_pre = DexInscription {
                 addr: src_addr.to_string(),
                 amt: 0,
@@ -938,7 +908,6 @@ impl Index {
                     dst_act_pre.amt = amt_dst;
 
                     dst_act_cur.amt = amt_dst + amt;
-                    b_dst = true;
                 }
                 if b_dst && b_src {
                     // get both address
@@ -968,61 +937,6 @@ impl Index {
             return Ok(());
         } else {
             return Err("drc doesn't support");
-        }
-    }
-
-    pub(crate) fn get_dex_id(&self, tick0: &String, tick1: &String) -> Option<u64> {
-        if tick0.is_empty() || tick1.is_empty() {
-            return None;
-        }
-        let h0;
-        let h1: u64;
-        let mut hasher = Sha256::new();
-        hasher.update(tick0);
-
-        if let Ok(data) = hasher.finalize()[0..8].try_into() {
-            h0 = u64::from_ne_bytes(data);
-        } else {
-            return None;
-        }
-        let mut hasher = Sha256::new();
-        hasher.update(tick1);
-        if let Ok(data) = hasher.finalize()[0..8].try_into() {
-            h1 = u64::from_ne_bytes(data);
-        } else {
-            return None;
-        }
-
-        Some(h0 ^ h1)
-    }
-
-    pub(crate) fn get_dex_name(&self, tick0: &String, tick1: &String) -> Option<(String, bool)> {
-        if tick0.is_empty() || tick1.is_empty() {
-            return None;
-        }
-        let h0;
-        let h1: u64;
-        let mut hasher = Sha256::new();
-        hasher.update(tick0);
-
-        if let Ok(data) = hasher.finalize()[0..8].try_into() {
-            h0 = u64::from_ne_bytes(data);
-        } else {
-            return None;
-        }
-        let mut hasher = Sha256::new();
-        hasher.update(tick1);
-        if let Ok(data) = hasher.finalize()[0..8].try_into() {
-            h1 = u64::from_ne_bytes(data);
-        } else {
-            return None;
-        }
-        if h0 <= h1 {
-            let tick = tick0.clone() + tick1;
-            Some((tick, true))
-        } else {
-            let tick = tick1.clone() + tick0;
-            Some((tick, false))
         }
     }
 
