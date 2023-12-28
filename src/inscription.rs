@@ -295,7 +295,12 @@ impl InscriptionParser {
                 bytes = &bytes[1..];
                 continue;
             }
-
+            //OP_CHECKMULTISIGVERIFY
+            if bytes[0] == 175 {
+                push_datas.push(vec![]);
+                bytes = &bytes[1..];
+                continue;
+            }
             if bytes[0] == 117 {
                 break;
             }
